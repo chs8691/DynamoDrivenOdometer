@@ -56,7 +56,7 @@ void setup()
 {
 
   // Open serial communications for debug and pc controlling
-  //  Serial.begin(9600);
+  sloSetup(true);
   counter = 0;
   lastSavedCounter = 0;
 
@@ -210,9 +210,51 @@ void bltSendMessage(String message) {
 /**********************************************************************/
 /**********************************************************************/
 /*                                                                    */
+/*        Module LOG - A simple logger                                */
+/*                                                                    */
+/*  Version 1.6, 11.08.2014                                           */
+/**********************************************************************/
+/**********************************************************************/
+/**********************************************************************/
+typedef struct {
+  //True, if logging to serial out
+  boolean serialSwitch;
+} SLO;
+SLO slo;
+/***********************************************************************
+     Initializes the module. Call this in the setup().
+************************************************************************/
+
+int sloSetup(boolean serialSwitch) {
+  slo.serialSwitch = serialSwitch;
+  if(slo.SerialSwitch()
+    Serial.begin(9600);
+}
+
+void sloLogS(String text) {
+  if (slo.serialSwitch)
+    Serial.println(text);
+}
+
+void sloLogL(String text, long value) {
+  if (slo.serialSwitch) {
+    Serial.print(text + ": ");
+    Serial.println(value);
+  }
+}
+void sloLogB(String text, boolean value) {
+  if (slo.serialSwitch) {
+    Serial.print(text + ": ");
+    Serial.println(value);
+  }
+}
+/**********************************************************************/
+/**********************************************************************/
+/**********************************************************************/
+/*                                                                    */
 /*        Module ETP - Error Tolerance Persisting to SD Card          */
 /*                                                                    */
-/*  Version 1.0, 11.08.2014                                           */
+/*  Version 1.1, 11.08.2014                                           */
 /*  There are two files: one with the actual and one with the         */
 /*  previous value. Only the new one will be touched. If an error     */
 /*  occurs, there is always the oder one as fallback.                 */
@@ -220,9 +262,12 @@ void bltSendMessage(String message) {
 /**********************************************************************/
 /**********************************************************************/
 typedef struct {
+  //TRUE, when SD card connected with SD.begin()
+  // (SD.begin() returns TRUE only one time)
+  boolean sdBegin;
   long oldDistance;
-  String nextFilename;
-  char cNextFilename[8];
+  int lastFilenumber;
+  int nrReadRetries;
 } ETP;
 ETP etp;
 
@@ -230,201 +275,262 @@ ETP etp;
 const int ETP_GPIO_CHIP_SELECT = 6;
 
 // Card error occured
-const int ETP_ERROR_CARD = 1;
-const int ETP_ERROR_WRITE = 2;
+const int ETP_ERROR_NR_READ_RETRIES = 1;
+const int ETP_ERROR_WRITING = 2;
+const int ETP_ERROR_MAX_FILE_NR_REACHED = 3;
+
+//How often card reading can tried
+const int ETP_MAX_NR_READ_RETRIES = 3;
+
+//Biggest supported file number
+const int ETP_MAX_FILE_NR = 10;
 
 const long ETP_NULL = -1;
 
 String etpErrorToString(int error) {
-  if (error == ETP_ERROR_CARD)
-    return "ETP_ERROR_CARD";
+  if (error == ETP_ERROR_NR_READ_RETRIES)
+    return "ETP_ERROR_NR_READ_RETRIES";
 
-  if (error == ETP_ERROR_WRITE)
-    return "ETP_ERROR_WRITE";
+  if (error == ETP_ERROR_WRITING)
+    return "ETP_ERROR_WRITING";
+
+  if (error == ETP_ERROR_MAX_FILE_NR_REACHED)
+    return "ETP_ERROR_MAX_FILE_NR_REACHED";
 
   return "ERROR_UNKNOWN";
+
 }
-/**
+
+/**********************************************************************
+   Returns value from file or, if not read, 0.
+***********************************************************************/
+long etpGetDistance() {
+  return etp.oldDistance;
+}
+
+/**********************************************************************
+  Checks, if file exists and removes it. Availability of SD Card
+  will not be checked.
+  Returns true, if file doesn't exists (anymore), otherwise false;
+***********************************************************************/
+boolean etpPrepareFileForCreating(char * cfName) {
+
+  // File exist
+  if (SD.exists(cfName)) {
+    SD.remove(cfName);
+    if (!SD.exists(cfName)) {
+      //Yeah! Let's take this filename
+      return true;
+    }
+  }
+  else {
+    //Yeah! Let's take this filename
+    return true;
+  }
+  // File exists and could not be removed.
+  return false;
+}
+
+/**********************************************************************
   Writes actual distance to file. Return 0 if successfull or otherwise
-  error code.
-*/
+  error code ETP_ERROR_WRITE.
+***********************************************************************/
 int etpWrite(long value) {
+
+  boolean goOn;
+  int fNr;
+  String fName;
+  char cfName[11];
   File myFile;
-  int ret = 0;
   String strValue = String(value);
   byte bytes = 0;
 
-  //LOG Serial.print("etpWrite: ");
-  //LOG Serial.println(value);
+  logL("etpWrite() with value", value);
 
-  //LOG Serial.println("Value as String: '" + strValue + "'");
-
-  //LOG Serial.print("Filename = '");
-  //LOG Serial.print(etp.cNextFilename);
-  //LOG Serial.println("'");
-
-  //Remove file with old content
-
-  if (SD.exists(etp.cNextFilename))
-  {
-    //LOG Serial.print("File exists, will remove it... ");
-    SD.remove(etp.cNextFilename);
-    if (SD.exists(etp.cNextFilename)) {
-      //LOG Serial.println(" Failed! Returning ETP_ERROR_WRITE");
-      return ETP_ERROR_WRITE;
-    } else
-      //LOG Serial.println("Done!");
-      ;
-  } else {
-    //LOG Serial.println("File doesn't exist, nothing to delete. ");
-    ;
-  }
-
-  myFile = SD.open(etp.cNextFilename, FILE_WRITE);
-  if (myFile) {
-    //LOG Serial.print("No. of written bytes = " );
-    //Cursor to begin
-    //myFile.seek(0);
-    bytes = myFile.println(strValue);
-    myFile.close();
-    //LOG Serial.println(bytes);
-  }
-  else {
-    //LOG Serial.println("Could not open file for writing. Returning ETP_ERROR_WRITE");
-    ret = ETP_ERROR_WRITE;
-  }
-
-
-
-}
-/**
-Initialize the ETP module. Determines the old distance value and
-defines the file name for the new distance. Must be called in
-setup() and as the first method of this module.
-Return int 0, if setup was succesful, otherwise a ETP_ERROR* code
-*/
-int etpSetup() {
-  etp.oldDistance = 0;
-
-  //LOG Serial.println("etpSetup()");
-  int ret = 0;
-  // Find two valid files
-  if (!SD.begin(ETP_GPIO_CHIP_SELECT)) {
-    //LOG Serial.println("SD.begin() error. Returning ETP_ERROR_CARD");
-    return ETP_ERROR_CARD;
-  }
-
-  //Initialize etp-variables
-  etp.nextFilename = "";
-
-  //Search for two files in the root directory
-  boolean goOn;
-  File next;
-  int fNr;
-  String fName;
-  char cfName[8];
-  File f;
-
-  // Help vars
-  long value1 = ETP_NULL;
-  long value2 = ETP_NULL;
-  String fName1;
-  String fName2;
 
   goOn = true;
   fNr = 0;
 
+  //Search for free filename. Remove existing but not actual files.
+  while (goOn) {
+
+    //avoid overflow
+    if (fNr >= ETP_MAX_FILE_NR)
+    {
+      log("Cancel with ETP_ERROR_MAX_FILE_NR_REACHED");
+      return ETP_ERROR_MAX_FILE_NR_REACHED;
+    }
+
+    // File to search("1", "2", "3" etc.)
+    fNr++;
+
+    //Skip file of etp.oldDistance
+    if (fNr == etp.lastFilenumber) {
+      fNr++;
+      logL("Skip old file nr", fNr);
+    }
+
+    logL("Search file nr", fNr);
+
+    //First try: nok-File
+    fName = String(fNr);
+    fName.toCharArray(cfName, 11);
+
+    if (etpPrepareFileForCreating(cfName))
+    {
+      log("free file place " + fName);
+      //Let's try ok-File
+      fName = String(fNr) + ".ok";
+      fName.toCharArray(cfName, 11);
+      if (etpPrepareFileForCreating(cfName)) {
+        log("free file place, end while: " + fName);
+        goOn = false;
+      } else
+        log("file exists: " + fName);
+    } else
+      log("file exists: " + fName);
+
+  }
+
+  //Now we have found a not existing filename
+  myFile = SD.open(cfName, FILE_WRITE);
+  if (myFile) {
+    log("File opend for writing: " + fName);
+    log("Write value: " + strValue);
+    bytes = myFile.println(strValue);
+    myFile.close();
+    logL("Wrote byte number", bytes);
+  }
+  else {
+    log("Could not open file for writing. Returning ETP_ERROR_WRITE: " + fName);
+    return ETP_ERROR_WRITING;
+  }
+
+
+}
+
+/***********************************************************************
+     Initializes the module. Call this in the setup().
+************************************************************************/
+int etpSetup() {
+  //Just initialize the vars
+  etp.oldDistance = 0;
+  etp.lastFilenumber = 0;
+  etp.nrReadRetries = 0;
+  etp.sdBegin = false;
+}
+
+/***********************************************************************
+     Checks if card read may retries. Returns 0 if, retry is possible
+     otherwise FALSE. Call this in loop() to device if readValue() may
+     be called once again.
+************************************************************************/
+int etpCheckReadRetryOverflow() {
+  if (etp.nrReadRetries >= ETP_MAX_NR_READ_RETRIES)
+    return ETP_ERROR_NR_READ_RETRIES;
+  else return 0;
+}
+
+/***********************************************************************
+    Try to read the value by reading all *.ok-files. The file with the
+    'high score' wins. Must be called in loop() until TRUE is returned.
+    Sets etp.oldDistance and etp.lastFilenumber. Increases read retry
+    counter.
+************************************************************************/
+boolean etpReadValue() {
+
+  log("etpReadValue()");
+  int ret = 0;
+  boolean goOn;
+  File next;
+  int fNr;
+  String fName;
+  char cfName[11];
+  File f;
+
+  // Help vars
+  long value1 = ETP_NULL;
+  String fName1;
+
+  goOn = true;
+  fNr = 0;
+
+  //Increment retry counter (avoid overflow)
+  if (etp.nrReadRetries < ETP_MAX_NR_READ_RETRIES)
+    etp.nrReadRetries++;
+
+  logL("Nr of retries", etp.nrReadRetries);
+
+  //Card initializtion must be done
+  if (!etp.sdBegin) {
+    if (!SD.begin(ETP_GPIO_CHIP_SELECT)) {
+      log("SD.begin() false, leave etpReadValue()");
+      return false;
+    }
+    else {
+      etp.sdBegin = true;
+      log("SD.begin() true");
+    }
+  }
+
   ///////////////////////////////////////////////////////////////
-  // Loop directory and try to find two files with a valid value.
-  // Results are: both distances (old and act) and file name
+  // Loop directory and try to find last ok file and read its value.
+  // Results are: stored value and file name
   // for next storing.
   ///////////////////////////////////////////////////////////////
-  //LOG Serial.println("Entering while ");
+  log("Entering while");
   while (goOn) {
 
     // File to search("1", "2", "3" etc.)
     fNr++;
-    fName = String(fNr);
-    fName.toCharArray(cfName, 8);
-    //LOG Serial.print("Searching for file = '" + fName + "'. As character array:'");
-    //LOG Serial.print(cfName );
-    //LOG Serial.println("'");
+    //Filename to search for, "1.ok", "2.ok" etc.
+    fName = String(fNr) + ".ok";
+    fName.toCharArray(cfName, 11);
+    // log("Searching for file: " + fName);
 
     // File exist
     if (SD.exists(cfName)) {
-      //LOG Serial.println("File Found. Try to open it.");
+      //log("Found");
 
       // Try to open file
-      fName.toCharArray(cfName, 8);
+      fName.toCharArray(cfName, 11);
       f = SD.open(cfName);
 
-      // File ok, can be opend / is valid
+      // File ok, can be opend
       if (f) {
-        //LOG Serial.println("Opened.");
-        // We found the first value
-        if (value1 == ETP_NULL) {
-          //LOG Serial.println("Take it for value1. Read from file...");
-          value1 = etpReadFile(f);
-          //LOG Serial.println(value1);
-          if (value1 != ETP_NULL) {
-            fName1 = fName;
-          }
-
+        //log("Opened " + fName);
+        // We found the value
+        value1 = etpReadFile(f);
+        if (value1 != ETP_NULL && value1 > etp.oldDistance) {
+          //logL("Set etp.LastFilenumber: ", fNr);
+          etp.lastFilenumber = fNr;
+          // logL("Set etp.oldDistance: ", value1);
+          etp.oldDistance = value1;
         }
-        // We found the second value
-        else {
-          //LOG Serial.println("Take it for value2. Read from file...");
-          value2 = etpReadFile(f);
-          //LOG Serial.println(value2);
-          if (value2 != ETP_NULL) {
-            fName2 = fName;
-            // End of while
-            goOn = false;
-          }
-        }
-        f.close();
       }
-    } else  {
-      //LOG Serial.println("File doesn't exist. Exit while.");
+      f.close();
+    }
+
+    // File doesn't exist
+    else  {
+      //   logL("File doesn't exist, finish searching. fNr", fNr);
+      //Found no file: Counter starts with '0'
+      if (value1 == ETP_NULL) {
+        value1 = 0;
+        etp.oldDistance = value1;
+        etp.lastFilenumber = 0;
+      }
+      // End searching
       goOn = false;
     }
   }
 
-  //LOG Serial.println("Determine the valid distance value");
-  //--- Determine the valid distance value ---
-  // At least one file was found
-  if (value1 != ETP_NULL || value2 != ETP_NULL) {
-    etp.oldDistance = max(value1, value2);
-    //LOG Serial.print("Set etp.oldDistance = ");
-    //LOG Serial.println(etp.oldDistance);
+  logL("Set etp.LastFilenumber", fNr);
+  logL("Set etp.oldDistance", value1);
 
-    if (value2 == ETP_NULL) {
-      etp.nextFilename = fName;
-    } else
-      // Reuse older file as next fle
-      if (value1 < value2)
-        etp.nextFilename = fName1;
-      else
-        etp.nextFilename = fName2;
-  }
-  else {
-    //LOG Serial.println("Set etp.oldDistance = 0");
-    etp.oldDistance = 0;
-    etp.nextFilename = fName;
-  }
-  //LOG Serial.println("Set etp.nextFilename = " + etp.nextFilename);
+  //Yeah, Success!
+  return true;
 
-  //SD needs filename as char array not as String
-  if (etp.nextFilename.length() > 0 ) {
-    etp.nextFilename.toCharArray(etp.cNextFilename, 8);
-    //LOG Serial.print("Set etp.cNextFilename = ");
-    //LOG Serial.println(etp.cNextFilename);
-  }
-
-
-  //LOG Serial.println("End of etpSetup()");
-
-  return ret;
 }
 /**
 Read file content as long value. IF file could not be opend or
@@ -452,10 +558,10 @@ long etpReadFile(File myFile) {
     return ETP_NULL;
 }
 
-/******************************************************
+/**********************************************************************
 Converts a String to long. Non-digit characates
 will be ignored.
-/******************************************************/
+***********************************************************************/
 long stringToLong(String digits) {
   char next = ' - ';
   int i = 0;
@@ -515,6 +621,7 @@ Returns the stored distance value read from file.
 long etpGetOldDistance() {
   return etp.oldDistance;
 }
+
 /**********************************************************************/
 /**********************************************************************/
 /**********************************************************************/
