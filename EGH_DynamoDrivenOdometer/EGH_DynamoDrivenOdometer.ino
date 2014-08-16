@@ -1,14 +1,21 @@
 /*
    Bike Distance Counter
+
    Features:
    - Needs no battery, just bike dynamo and power support
      of the buffered front light
-   - Read the actual distance via Bluetooth 4.0 with the Android App
+   - Read the actual wheel rotation and store it on SD card
+   - Communicate the value via Bluetooth 4.0 to the Android App
+
+
+
  */
 
 // include the SD library:
 #include <SPI.h>
 #include <SD.h>
+#include <RFduinoBLE.h>
+
 
 
 ////////////////////////////////////////////////////////
@@ -22,10 +29,25 @@ const int TRIGGER_PIN = 1;    // select the input pin for the potentiometer
 ////////////////////////////////////////////////////////
 // Variable declarations
 ////////////////////////////////////////////////////////
-// Actual Distance value (TODO: switch from ticks to KM)
-int counter;
-int lastSavedCounter;
+// Actual Distance value as ticks (rotation counter)
+long counter;
+long lastSavedCounter;
 
+// True, if a hard error occured
+boolean error;
+
+// Temp return value of an method call.
+int ret = 0;
+
+// TRUE, when SD card is online
+boolean cardOn;
+// Try periodically to open SD card
+long cardNextBeginRetry;
+
+String errorMessage;
+
+// In error case count for next sending
+boolean errorSend;
 
 /******************************************************
   Setup
@@ -34,46 +56,168 @@ void setup()
 {
 
   // Open serial communications for debug and pc controlling
-  Serial.begin(9600);
+  //  Serial.begin(9600);
+  counter = 0;
+  lastSavedCounter = 0;
+
+  error = false;
+  errorMessage = "-";
+  errorSend = false;
+
+  cardOn = false;
 
   // Initialize the modules
-  rstSetup(REED);
   lecSetup(LED);
-  powerSetup(TRIGGER_PIN);
+  bltSetup("UP");
+  rstSetup(REED);
+  psmSetup(TRIGGER_PIN);
 
-  int ret = 0;
-  ret = etpSetup();
-  if (ret > 0) {
-    Serial.print(ret);
-    Serial.println(": Error in etpSetup().Cancel program.");
-  }
-  counter = etpGetOldDistance();
-  lastSavedCounter = counter;
-  
+  cardNextBeginRetry = millis() + 1000;
 
-  Serial.println("End of setup()");
+  //  Serial.println("End of setup()");
 }
 /******************************************************
   Loop
 /******************************************************/
 void loop(void) {
 
-  //Count wheels rotations
-  if (rstRead()) {
-    counter++;
-    lecSwitchLed();
+  //Card module needs more time to come up
+  //Retry until successful connected
+  if (!cardOn && millis() > cardNextBeginRetry) {
+    ret = etpSetup();
+    if (ret == 0) {
+      //Add stored value to actual turns
+      counter += etpGetOldDistance();
+      lastSavedCounter = etpGetOldDistance();
+      cardOn = true;
+      lecBlink();
+    }
+    else
+      //Wait a second to try it again
+      cardNextBeginRetry = millis() + 1000;
   }
-  
-  //Save to card when power breaks down
-  if(powerCheck() && counter != lastSavedCounter){
-//    etpWrite(counter);
+
+
+  // Normal mode
+  else {
+
+    //Count wheels rotations and send to app
+    if (rstRead()) {
+      counter++;
+      lecFlash();
+      bltSendData(counter);
+    }
+
+    //Save to card when power breaks down
+    if (psmCheck() && counter != lastSavedCounter) {
+      if (cardOn) {
+        ret = etpWrite(counter);
+        if (ret == 0)
+          lecBlink();
+        else
+        { lecIntervalStart();
+          error = true;
+          errorMessage = etpErrorToString(ret);
+        }
+      }
+      else
+      { lecIntervalStart();
+        error = true;
+        errorMessage = "ERROR_CARD_NOT_INIT";
+      }
+    }
+  }
+  //Give LED the control
+  lecControl();
 }
-
-
-}
-
 /**********************************************************************/
+/**********************************************************************/
+/**********************************************************************/
+/*                                                                    */
+/*        Module BLT - Bluetooth LE Trasmitter                        */
+/*                                                                    */
+/*  Version 1.0, 11.08.2014                                           */
+/*  Sends a value via BT LE in the format char(28), closed with \0:   */
+/*  D<long>: a long number, for instance "D2147483647"                */
+/*  M<String>: a message,  for instance "MSD_READ_ERROR"              */
+/**********************************************************************/
+/**********************************************************************/
+/**********************************************************************/
+typedef struct {
+
+  //Temp. buffer with data
+  char buf[28];
+
+  // data string to send
+  String data;
+} Blt;
+Blt blt;
+
+// How often data will be send in milliseconds. Increase value to
+// save energy
+const int BLT_INTERVAL_MS = 1000;
+
+// Name of the device, appears in the advertising. Keep it short.
+const char* BLT_DEVICE_NAME = "DDO";
+
+/**********************************************************************
+   Initializes BLT module. Call this in setup().
+/*********************************************************************/
+void bltSetup(String welcomeMessage) {
+
+
+  //Set interval von BLE exchange //TODO Neede?
+  // RFduinoBLE.advertisementInterval = BLT_INTERVAL_MS;
+
+  //set the BLE device name as it will appear when advertising
+  RFduinoBLE.deviceName = BLT_DEVICE_NAME;
+
+  // start the BLE stack
+  RFduinoBLE.begin();
+
+  //Initialize send data
+  bltSendMessage(welcomeMessage);
+}
+
+/**********************************************************************
+  Sends a long value as distance message, e.g. "D12345". Character
+  'D' will be add as prefix.
+/*********************************************************************/
+void bltSendData(long value) {
+
+  // Send actual distance
+  blt.data = "D" + String(value) + String('\0');
+
+  blt.data.toCharArray(blt.buf, 28);
+  RFduinoBLE.send(blt.buf, 28);
+
+}
+
+/**********************************************************************
+  Sends message, e.g. "MERROR_SD_CARD_WRITE"
+  String message Message text with < 26 characters, without lead 'M'.
+/*********************************************************************/
+void bltSendMessage(String message) {
+
+  // Send actual distance
+  blt.data = "M" + message + String('\0');
+
+  blt.data.toCharArray(blt.buf, 28);
+  RFduinoBLE.send(blt.buf, 28);
+
+}
+/**********************************************************************/
+/**********************************************************************/
+/**********************************************************************/
+/*                                                                    */
 /*        Module ETP - Error Tolerance Persisting to SD Card          */
+/*                                                                    */
+/*  Version 1.0, 11.08.2014                                           */
+/*  There are two files: one with the actual and one with the         */
+/*  previous value. Only the new one will be touched. If an error     */
+/*  occurs, there is always the oder one as fallback.                 */
+/**********************************************************************/
+/**********************************************************************/
 /**********************************************************************/
 typedef struct {
   long oldDistance;
@@ -91,6 +235,15 @@ const int ETP_ERROR_WRITE = 2;
 
 const long ETP_NULL = -1;
 
+String etpErrorToString(int error) {
+  if (error == ETP_ERROR_CARD)
+    return "ETP_ERROR_CARD";
+
+  if (error == ETP_ERROR_WRITE)
+    return "ETP_ERROR_WRITE";
+
+  return "ERROR_UNKNOWN";
+}
 /**
   Writes actual distance to file. Return 0 if successfull or otherwise
   error code.
@@ -101,41 +254,43 @@ int etpWrite(long value) {
   String strValue = String(value);
   byte bytes = 0;
 
-  Serial.print("etpWrite: ");
-  Serial.println(value);
+  //LOG Serial.print("etpWrite: ");
+  //LOG Serial.println(value);
 
-  Serial.println("Value as String: '" + strValue + "'");
+  //LOG Serial.println("Value as String: '" + strValue + "'");
 
-  Serial.print("Filename = '");
-  Serial.print(etp.cNextFilename);
-  Serial.println("'");
+  //LOG Serial.print("Filename = '");
+  //LOG Serial.print(etp.cNextFilename);
+  //LOG Serial.println("'");
 
   //Remove file with old content
 
   if (SD.exists(etp.cNextFilename))
   {
-    Serial.print("File exists, will remove it... ");
+    //LOG Serial.print("File exists, will remove it... ");
     SD.remove(etp.cNextFilename);
     if (SD.exists(etp.cNextFilename)) {
-      Serial.println(" Failed! Returning ETP_ERROR_WRITE");
+      //LOG Serial.println(" Failed! Returning ETP_ERROR_WRITE");
       return ETP_ERROR_WRITE;
     } else
-      Serial.println("Done!");
+      //LOG Serial.println("Done!");
+      ;
   } else {
-    Serial.println("File doesn't exist, nothing to delete. ");
+    //LOG Serial.println("File doesn't exist, nothing to delete. ");
+    ;
   }
 
   myFile = SD.open(etp.cNextFilename, FILE_WRITE);
   if (myFile) {
-    Serial.print("No. of written bytes = " );
+    //LOG Serial.print("No. of written bytes = " );
     //Cursor to begin
     //myFile.seek(0);
     bytes = myFile.println(strValue);
-      myFile.close();
-    Serial.println(bytes);
+    myFile.close();
+    //LOG Serial.println(bytes);
   }
   else {
-    Serial.println("Could not open file for writing. Returning ETP_ERROR_WRITE");
+    //LOG Serial.println("Could not open file for writing. Returning ETP_ERROR_WRITE");
     ret = ETP_ERROR_WRITE;
   }
 
@@ -149,11 +304,13 @@ setup() and as the first method of this module.
 Return int 0, if setup was succesful, otherwise a ETP_ERROR* code
 */
 int etpSetup() {
-  Serial.println("etpSetup()");
+  etp.oldDistance = 0;
+
+  //LOG Serial.println("etpSetup()");
   int ret = 0;
   // Find two valid files
   if (!SD.begin(ETP_GPIO_CHIP_SELECT)) {
-    Serial.println("SD.begin() error. Returning ETP_ERROR_CARD");
+    //LOG Serial.println("SD.begin() error. Returning ETP_ERROR_CARD");
     return ETP_ERROR_CARD;
   }
 
@@ -182,20 +339,20 @@ int etpSetup() {
   // Results are: both distances (old and act) and file name
   // for next storing.
   ///////////////////////////////////////////////////////////////
-  Serial.println("Entering while ");
+  //LOG Serial.println("Entering while ");
   while (goOn) {
 
     // File to search("1", "2", "3" etc.)
     fNr++;
     fName = String(fNr);
     fName.toCharArray(cfName, 8);
-    Serial.print("Searching for file = '" + fName + "'. As character array:'");
-    Serial.print(cfName );
-    Serial.println("'");
+    //LOG Serial.print("Searching for file = '" + fName + "'. As character array:'");
+    //LOG Serial.print(cfName );
+    //LOG Serial.println("'");
 
     // File exist
     if (SD.exists(cfName)) {
-      Serial.println("File Found. Try to open it.");
+      //LOG Serial.println("File Found. Try to open it.");
 
       // Try to open file
       fName.toCharArray(cfName, 8);
@@ -203,12 +360,12 @@ int etpSetup() {
 
       // File ok, can be opend / is valid
       if (f) {
-        Serial.println("Opened.");
+        //LOG Serial.println("Opened.");
         // We found the first value
         if (value1 == ETP_NULL) {
-          Serial.println("Take it for value1. Read from file...");
+          //LOG Serial.println("Take it for value1. Read from file...");
           value1 = etpReadFile(f);
-          Serial.println(value1);
+          //LOG Serial.println(value1);
           if (value1 != ETP_NULL) {
             fName1 = fName;
           }
@@ -216,9 +373,9 @@ int etpSetup() {
         }
         // We found the second value
         else {
-          Serial.println("Take it for value2. Read from file...");
+          //LOG Serial.println("Take it for value2. Read from file...");
           value2 = etpReadFile(f);
-          Serial.println(value2);
+          //LOG Serial.println(value2);
           if (value2 != ETP_NULL) {
             fName2 = fName;
             // End of while
@@ -228,18 +385,18 @@ int etpSetup() {
         f.close();
       }
     } else  {
-      Serial.println("File doesn't exist. Exit while.");
+      //LOG Serial.println("File doesn't exist. Exit while.");
       goOn = false;
     }
   }
 
-  Serial.println("Determine the valid distance value");
+  //LOG Serial.println("Determine the valid distance value");
   //--- Determine the valid distance value ---
   // At least one file was found
   if (value1 != ETP_NULL || value2 != ETP_NULL) {
     etp.oldDistance = max(value1, value2);
-    Serial.print("Set etp.oldDistance = ");
-    Serial.println(etp.oldDistance);
+    //LOG Serial.print("Set etp.oldDistance = ");
+    //LOG Serial.println(etp.oldDistance);
 
     if (value2 == ETP_NULL) {
       etp.nextFilename = fName;
@@ -251,21 +408,21 @@ int etpSetup() {
         etp.nextFilename = fName2;
   }
   else {
-    Serial.println("Set etp.oldDistance = 0");
+    //LOG Serial.println("Set etp.oldDistance = 0");
     etp.oldDistance = 0;
     etp.nextFilename = fName;
   }
-  Serial.println("Set etp.nextFilename = " + etp.nextFilename);
+  //LOG Serial.println("Set etp.nextFilename = " + etp.nextFilename);
 
   //SD needs filename as char array not as String
   if (etp.nextFilename.length() > 0 ) {
     etp.nextFilename.toCharArray(etp.cNextFilename, 8);
-    Serial.print("Set etp.cNextFilename = ");
-    Serial.println(etp.cNextFilename);
+    //LOG Serial.print("Set etp.cNextFilename = ");
+    //LOG Serial.println(etp.cNextFilename);
   }
 
 
-  Serial.println("End of etpSetup()");
+  //LOG Serial.println("End of etpSetup()");
 
   return ret;
 }
@@ -355,79 +512,23 @@ long stringToLong(String digits) {
 /**
 Returns the stored distance value read from file.
 */
-int etpGetOldDistance() {
+long etpGetOldDistance() {
   return etp.oldDistance;
 }
 /**********************************************************************/
-/*        Module RST - Reed Switch Trigger                            */
 /**********************************************************************/
-typedef struct {
-  // GPIO of the reed input
-  int gpio;
-  // Last reed value
-  int last;
-
-  // act value
-  int act;
-
-  // Time when next value can be read
-  // to elimate switch bouncing
-  long nextMs;
-
-  boolean readReturn;
-} Rst;
-Rst rst;
-
-// For filtering hardware bouncing
-const long RST_BOUNCE_MS = 10;
-
-/**
-   Returns true, if reed switched from off to on. Use this in loop()
-   to recognize wheel movement.
-*/
-boolean rstRead() {
-
-  //Hardware bouncing time over
-  if (millis() > rst.nextMs) {
-
-    rst.act = digitalRead(REED);
-    if (rst.act == 1 && rst.last == 0) {
-      rst.nextMs = millis() + RST_BOUNCE_MS;
-      rst.readReturn = true;
-    }
-    else
-      rst.readReturn = false;
-
-    rst.last = rst.act;
-  }
-  else
-    rst.readReturn = false;
-
-  return rst.readReturn;
-
-}
-
-/**
-   Initializes RST module. Call this in setup().
-   int gpioReed GPIO number of the reed input signal
-*/
-void rstSetup(int gpioReed) {
-  rst.last = 0;
-  rst.act = 0;
-  rst.nextMs = 0;
-  rst.readReturn = false;
-
-  rst.gpio = gpioReed;
-  pinMode(rst.gpio, INPUT);
-}
 /**********************************************************************/
 /*        Module LEC - LED Control                                    */
+/*                                                                    */
+/*  Version 1.0, 11.08.2014                                           */
 /*  Supports one LED with different light programs. A program can     */
 /*  only be started once and there can only run on program at once.   */
 /*  There is priority order between the programs:                     */
 /*  Prio 1: Interval on/off: flashing slowly                          */
 /*  Prio 2: Quick blinking for 5 times.                               */
 /*  Prio 3: Single flash.                                             */
+/**********************************************************************/
+/**********************************************************************/
 /**********************************************************************/
 typedef struct {
   int ledStatus;
@@ -586,35 +687,54 @@ void lecSetup(int gpioLed) {
   lec.counter = 0;
   pinMode(lec.gpio, OUTPUT);
 }
-/************************************************************/
-/*              Power Supply Module                         */
-/************************************************************/
+/**********************************************************************/
+/**********************************************************************/
+/**********************************************************************/
+/*                      Power Supply Module                           */
+/*                                                                    */
+/*  Version 1.0, 11.08.2014                                           */
+/* Secondary voltage signal on analog input for controlling power     */
+/* fade out. There is a bycicle dynamo who powers the B&M LED front   */
+/* light- Lumotec IQ. The B&M has two outputs: One is the LED power,  */
+/* a DC voltage limited to ~ 3.5 V and with a big capicator for stand */
+/* light support. This power will be used for powering the RFDuino.   */
+/* The second output of the B&M is for the taillight, it is the AC    */
+/* voltage of the dynamo and can be >> than 3.5 V. For the RFDuino    */
+/* this signal will be used for triggering the end of power. Be       */
+/* careful, the maximum input voltage of RFDuino is 3.6 V AC. It has  */
+/* to be limited and rectified.                                       */
+/**********************************************************************/
+/**********************************************************************/
+/**********************************************************************/
 // Variables for Powermanagement all starting with 'power'
 typedef struct {
   long startTime;
-  
+
   // variable to store the value coming from the sensor
-  int triggerValue;  
-  
+  int triggerValue;
+
   //GPIO of the voltage power in signal that is the trigger
-  int triggerPin;   
+  int triggerPin;
 
   // Temp var measures latency timer after power down for
   // smoothing the voltage oscillation of the trigger signal
   // (converted AC voltage)
   long timer;
-  
-  // Switch is true, if voltage drop has been communicated once 
-  // powerCheck(). Otherwise false;
+
+  // Switch is true, if voltage drop has been communicated once
+  // psmCheck(). Otherwise false;
   boolean fired;
-  
-  // Counts number of trigger voltage above threshold. The 
-  // powerCheck() only fires, if system is long enough 'up'
+
+  // Counts number of trigger voltage above threshold. The
+  // psmCheck() only fires, if system is long enough 'up'
   // since last fire. This avoids fireing at low voltage.
   int upCount;
 
-} Power;
-Power power;
+  // Local variable for psmCheck()
+  boolean ret;
+
+} Psm;
+Psm psm;
 
 // Time between two measurement. Because the trigger signal is
 // a AC signal the normal sinus wave has to be compensated
@@ -622,101 +742,173 @@ Power power;
 // and the mininum velocity that has to be recognized
 // Minimum supported velocity: 3 km/h (0.83 m/s)
 // Shimano: ~ 10 1/revolution -> 166 ms
-const long POWER_LATENCY = 166;
+const long PSM_LATENCY = 166;
 
 // Defines the analog input value the voltage must fall below for
 // fireing powerCheck() = true.
 // Increase the value if trigger signal has a very low voltage value
-const int POWER_THRESHOLD = 950;
+const int PSM_THRESHOLD = 950;
 
-// Latency time in milliseconds before powerCheck() will fire for the first 
+// Latency time in milliseconds before powerCheck() will fire for the first
 // time or for the next time after a powerCheck() returned true.
 // Increase the value if very short distances should not be stored.
-const int POWER_START_LATENCY_DURATION = 2000;
+const int PSM_START_LATENCY_DURATION = 2000;
 
-// Number of high voltage trigger signals that have to be reached before 
+// Number of high voltage trigger signals that have to be reached before
 // powerCheck() can fire.
 // Increase the value, if the system has to be up for a longer time before
 // next fireing.
-const int POWER_UP_COUNT_LIMIT = 10000;
+const int PSM_UP_COUNT_LIMIT = 10000;
 
 // The trigger voltage must be above this value to increment the upCount.
 // Decrease this, if the upCount doesn't reach the UP_COUNT_MIN.
-// Increase this, if there is not enough voltage when the powerCheck() fires. 
-const int POWER_UP_THRESHOLD = 980;
+// Increase this, if there is not enough voltage when the powerCheck() fires.
+const int PSM_UP_THRESHOLD = 980;
 
 
 /**
   Returns for one time true, if power is going down, otherwise false.
-  For a latency time after setup and after fireing true 
+  For a latency time after setup and after fireing true
   false will be returned.
   Use this in the loop() to check when power breaks down.
   Reads the analogInput of the trigger sginal.
 */
-boolean powerCheck(){
+boolean psmCheck() {
+  //  Serial.println("psmCheck()");
 
-  boolean ret = false;
-  
+  psm.ret = false;
+
   // Read trigger input
-  power.triggerValue = analogRead(power.triggerPin);
+  psm.triggerValue = analogRead(psm.triggerPin);
+  // Serial.println(analogRead(1));
 
   // Check up criteria
-  if(power.triggerValue >= POWER_UP_THRESHOLD && power.upCount < POWER_UP_COUNT_LIMIT){
-     power.upCount ++;
-   }
+  if (psm.triggerValue >= PSM_UP_THRESHOLD && psm.upCount < PSM_UP_COUNT_LIMIT) {
+    psm.upCount ++;
+  }
 
   // If trigger signal high, reset timer and switch
-  if (power.triggerValue >= POWER_THRESHOLD) {
-    power.timer = millis() + POWER_LATENCY;
-    power.fired = false;
+  if (psm.triggerValue >= PSM_THRESHOLD) {
+    psm.timer = millis() + PSM_LATENCY;
+    psm.fired = false;
   }
-   
+
   //Normal mode starts after 1 second up time
-  if (millis() > power.startTime) {
+  if (millis() > psm.startTime) {
     // Check if trigger is low for latency time
-    if (power.triggerValue < POWER_THRESHOLD //
-    && millis() > power.timer  //
-    && power.fired == false //
-    && power.upCount >= POWER_UP_COUNT_LIMIT)
+    if (psm.triggerValue < PSM_THRESHOLD //
+        && millis() > psm.timer  //
+        && psm.fired == false //
+        && psm.upCount >= PSM_UP_COUNT_LIMIT)
     {
-      ret = true;
-      power.fired = true;
-      power.startTime = millis() + POWER_START_LATENCY_DURATION;
-      power.upCount = 0;
+      psm.ret = true;
+      psm.fired = true;
+      psm.startTime = millis() + PSM_START_LATENCY_DURATION;
+      psm.upCount = 0;
     }
   }
-  
-  return ret;
-  
-} 
+
+  return psm.ret;
+
+}
 /**
   Initialize power supply module. Call this once in startup().
   triggerPin: GPIO with the voltage trigger signal
 */
-void powerSetup(int triggerPin){
-  
+void psmSetup(int triggerPin) {
+
   // Let the Board time for start up
-  power.startTime = millis() + POWER_START_LATENCY_DURATION;
-  
+  psm.startTime = millis() + PSM_START_LATENCY_DURATION;
+
   // Init value for a good feeling
-  power.triggerValue = 0;
-  
+  psm.triggerValue = 0;
+
   // Reset temp. var
-  power.timer = 0;
-  
+  psm.timer = 0;
+
   // Not send yet
-  power.fired = false;
-  
+  psm.fired = false;
+
   // Define GPIO with the trigger signal
-  power.triggerPin = triggerPin;
-  
+  psm.triggerPin = triggerPin;
+
   // Reset limit
-  power.upCount = 0;
-  
+  psm.upCount = 0;
+
   // declare the analog in pin as input (default)
-  pinMode(power.triggerPin, INPUT);
-  digitalWrite(power.triggerPin, LOW);
+  //  pinMode(psm.triggerPin, INPUT);
+  //  digitalWrite(psm.triggerPin, LOW);
 
 }
 
+
+/**********************************************************************/
+/**********************************************************************/
+/**********************************************************************/
+/*        Module RST - Reed Switch Trigger                            */
+/*                                                                    */
+/*  Version 1.0, 11.08.2014                                           */
+/*  Read the reed contact. Works contact bounce free.                 */
+/**********************************************************************/
+/**********************************************************************/
+/**********************************************************************/
+typedef struct {
+  // GPIO of the reed input
+  int gpio;
+  // Last reed value
+  int last;
+
+  // act value
+  int act;
+
+  // Time when next value can be read
+  // to elimate switch bouncing
+  long nextMs;
+
+  boolean readReturn;
+} Rst;
+Rst rst;
+
+// For filtering hardware bouncing
+const long RST_BOUNCE_MS = 10;
+
+/**
+   Returns true, if reed switched from off to on. Use this in loop()
+   to recognize wheel movement.
+*/
+boolean rstRead() {
+
+  //Hardware bouncing time over
+  if (millis() > rst.nextMs) {
+
+    rst.act = digitalRead(REED);
+    if (rst.act == 1 && rst.last == 0) {
+      rst.nextMs = millis() + RST_BOUNCE_MS;
+      rst.readReturn = true;
+    }
+    else
+      rst.readReturn = false;
+
+    rst.last = rst.act;
+  }
+  else
+    rst.readReturn = false;
+
+  return rst.readReturn;
+
+}
+
+/**
+   Initializes RST module. Call this in setup().
+   int gpioReed GPIO number of the reed input signal
+*/
+void rstSetup(int gpioReed) {
+  rst.last = 0;
+  rst.act = 0;
+  rst.nextMs = 0;
+  rst.readReturn = false;
+
+  rst.gpio = gpioReed;
+  pinMode(rst.gpio, INPUT);
+}
 

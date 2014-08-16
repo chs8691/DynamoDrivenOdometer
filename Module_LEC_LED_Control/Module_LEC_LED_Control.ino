@@ -61,13 +61,19 @@ void loop() {
 
 
 /**********************************************************************/
+/**********************************************************************/
+/**********************************************************************/
 /*        Module LEC - LED Control                                    */
+/*                                                                    */
+/*  Version 1.0, 11.08.2014                                           */
 /*  Supports one LED with different light programs. A program can     */
 /*  only be started once and there can only run on program at once.   */
 /*  There is priority order between the programs:                     */
 /*  Prio 1: Interval on/off: flashing slowly                          */
 /*  Prio 2: Quick blinking for 5 times.                               */
 /*  Prio 3: Single flash.                                             */
+/**********************************************************************/
+/**********************************************************************/
 /**********************************************************************/
 typedef struct {
   int ledStatus;

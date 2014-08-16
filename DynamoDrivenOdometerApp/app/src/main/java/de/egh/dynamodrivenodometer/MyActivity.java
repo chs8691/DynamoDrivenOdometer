@@ -10,6 +10,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.ServiceConnection;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.os.Bundle;
 import android.os.Handler;
@@ -17,6 +18,7 @@ import android.os.IBinder;
 import android.util.Log;
 import android.view.Menu;
 import android.view.MenuItem;
+import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -128,7 +130,7 @@ public class MyActivity extends Activity {
 			else if (BluetoothLeService.ACTION_DATA_AVAILABLE.equals(action)) {
 //				Log.v(TAG, "GATT data available.");
 				processMessage(intent.getStringExtra(BluetoothLeService.EXTRA_DATA));
-//				startJob(true); //TODO
+		startJob(true);
 			}
 
 			// Default
@@ -176,6 +178,8 @@ public class MyActivity extends Activity {
 				}
 			};
 	private TextView gattConnectedView;
+	private SharedPreferences settings;
+	private Switch switchPermanent;
 
 	private static IntentFilter makeGattUpdateIntentFilter() {
 		final IntentFilter intentFilter = new IntentFilter();
@@ -257,7 +261,7 @@ public class MyActivity extends Activity {
 		}
 
 		if (message != null) {
-//			messageBox.add(message); TODO
+			messageBox.add(message);
 		}
 
 		updateUI();
@@ -266,12 +270,15 @@ public class MyActivity extends Activity {
 	/**
 	 * Brings the received data to the UI.
 	 */
-
 	private void updateUI() {
 		distanceValueView.setText(String.valueOf(dodDistanceValue));
 		lastUpdateAtView.setText("" + sdf.format(new Date(dodLastUpdateAt)));
-//		messageView.setText(messageBox.asString());
 
+		String all = "";
+		for (MessageBox.Msg msg : messageBox.getSorted()) {
+			all += sdf.format(new Date(msg.getTimestamp())) + " " + msg.getText() + "\n";
+			messageView.setText(all);
+		}
 	}
 
 	/**
@@ -294,6 +301,15 @@ public class MyActivity extends Activity {
 	}
 
 	@Override
+	protected void onStop() {
+     SharedPreferences.Editor editor = settings.edit();
+		editor.putString(Constants.SharedPrefs.MESSAGES,messageBox.asString());
+		editor.putBoolean(Constants.SharedPrefs.SWITCH_PERMANENT, switchPermanent.isChecked());
+
+		editor.commit();
+	}
+
+	@Override
 	protected void onPause() {
 		super.onPause();
 
@@ -308,6 +324,9 @@ public class MyActivity extends Activity {
 		if (mBluetoothLeService != null) {
 			mBluetoothLeService.close();
 		}
+
+		//Store messages
+		//TODO
 
 	}
 
@@ -438,11 +457,17 @@ public class MyActivity extends Activity {
 		lastUpdateAtView = (TextView) findViewById(R.id.lastUpdateValue);
 		messageView = (TextView) findViewById(R.id.messageValue);
 		gattConnectedView = (TextView) findViewById(R.id.gattConnectedValue);
+		switchPermanent = (Switch) findViewById(R.id.switchPermanent);
 
 		//Restore values from previous run
 		dodDistanceValue = getSharedPreferences(Constants.SharedPrefs.NAME, 0).getLong(Constants.SharedPrefs.DISTANCE, 0);
 		dodLastUpdateAt = getSharedPreferences(Constants.SharedPrefs.NAME, 0).getLong(Constants.SharedPrefs.LAST_UPDATE_AT, 0);
 
+		// Restore preferences
+		settings = getSharedPreferences(Constants.SharedPrefs.NAME, 0);
+
+		messageBox = new MessageBox(settings.getString(Constants.SharedPrefs.MESSAGES, null));
+		switchPermanent.setChecked( settings.getBoolean(Constants.SharedPrefs.SWITCH_PERMANENT, false));
 
 		mHandler = new Handler();
 
@@ -499,6 +524,23 @@ public class MyActivity extends Activity {
 				mBluetoothLeService.close();
 				scanLeDevice(true);
 				break;
+
+			case R.id.menu_msg1:
+				messageBox.add("Meldung 1");
+				updateUI();
+				break;
+			case R.id.menu_msg2:
+				messageBox.add("Meldung 2");
+				updateUI();
+				break;
+			case R.id.menu_msg3:
+				messageBox.add("Meldung 3");
+				updateUI();
+				break;
+			case R.id.menu_msg4:
+				messageBox.add("Meldung 4");
+				updateUI();
+				break;
 		}
 		return true;
 	}
@@ -511,6 +553,7 @@ public class MyActivity extends Activity {
 			static final String DISTANCE = "DISTANCE";
 			static final String LAST_UPDATE_AT = "LAST_UPDATE_AT";
 			static final String MESSAGES = "MESSAGES";
+			static final String SWITCH_PERMANENT = "SWITCH_PERMANENT";
 		}
 
 		abstract class Device {

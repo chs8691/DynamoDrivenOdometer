@@ -91,7 +91,17 @@ void loop(void) {
 }
 
 /**********************************************************************/
+/**********************************************************************/
+/**********************************************************************/
+/*                                                                    */
 /*        Module ETP - Error Tolerance Persisting to SD Card          */
+/*                                                                    */
+/*  Version 1.0, 11.08.2014                                           */
+/*  There are two files: one with the actual and one with the         */
+/*  previous value. Only the new one will be touched. If an error     */   
+/*  occurs, there is always the oder one as fallback.                 */  
+/**********************************************************************/
+/**********************************************************************/
 /**********************************************************************/
 typedef struct {
   long oldDistance;
@@ -108,6 +118,18 @@ const int ETP_ERROR_CARD = 1;
 const int ETP_ERROR_WRITE = 2;
 
 const long ETP_NULL = -1;
+
+String etpErrorToString(int error){
+  if(error == ETP_ERROR_CARD)
+    return "ETP_ERROR_CARD";
+
+  if(error == ETP_ERROR_WRITE)
+    return "ETP_ERROR_WRITE";
+  
+  return "ERROR_UNKNOWN";
+    
+}
+
 
 /**
   Writes actual distance to file. Return 0 if successfull or otherwise

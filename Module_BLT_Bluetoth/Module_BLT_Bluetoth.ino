@@ -67,10 +67,17 @@ void switchLed() {
 
 
 /**********************************************************************/
+/**********************************************************************/
+/**********************************************************************/
+/*                                                                    */
 /*        Module BLT - Bluetooth LE Trasmitter                        */
+/*                                                                    */
+/*  Version 1.0, 11.08.2014                                           */
 /*  Sends a value via BT LE in the format char(28), closed with \0:   */
 /*  D<long>: a long number, for instance "D2147483647"                */
 /*  M<String>: a message,  for instance "MSD_READ_ERROR"              */
+/**********************************************************************/
+/**********************************************************************/
 /**********************************************************************/
 typedef struct {
   
@@ -109,7 +116,7 @@ void bltSetup() {
   Sends a long value as distance message, e.g. "D12345". Character
   'D' will be add as prefix.
 /*********************************************************************/
-void sendData(long value) {
+void bltSendData(long value) {
 
   // Send actual distance
   blt.data = "D" + String(value) + String('\0');
@@ -123,7 +130,7 @@ void sendData(long value) {
   Sends message, e.g. "MERROR_SD_CARD_WRITE"
   String message Message text with < 26 characters, without lead 'M'.
 /*********************************************************************/
-void sendMessage(String message) {
+void bltSendMessage(String message) {
 
   // Send actual distance
   blt.data = "M" + message + String('\0');

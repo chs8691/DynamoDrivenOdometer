@@ -29,8 +29,10 @@ public class BluetoothLeService extends Service {
 			"de.egh.dynamodrivenodometer.ACTION_GATT_DISCONNECTED";
 	public final static String ACTION_GATT_SERVICES_DISCOVERED =
 			"de.egh.dynamodrivenodometer.ACTION_GATT_SERVICES_DISCOVERED";
-	public final static String ACTION_DATA_AVAILABLE =
-			"de.egh.dynamodrivenodometer.ACTION_DATA_AVAILABLE";
+	public final static String ACTION_VALUE_AVAILABLE =
+			"de.egh.dynamodrivenodometer.ACTION_VALUE_AVAILABLE";
+	public final static String ACTION_MESSAGE_AVAILABLE =
+			"de.egh.dynamodrivenodometer.ACTION_MESSAGE_AVAILABLE";
 	public final static String EXTRA_DATA =
 			"de.egh.dynamodrivenodometer.EXTRA_DATA";
 	private final static String TAG = BluetoothLeService.class.getSimpleName();
@@ -86,9 +88,7 @@ public class BluetoothLeService extends Service {
 			}
 		}
 
-		private void broadcastUpdate(final String action,
-		                             final BluetoothGattCharacteristic characteristic) {
-			final Intent intent = new Intent(action);
+		private String characteristicValue(BluetoothGattCharacteristic characteristic) {
 
 			// For all other profiles, writes the data formatted in HEX.
 			final byte[] data = characteristic.getValue();
@@ -96,20 +96,21 @@ public class BluetoothLeService extends Service {
 
 				final StringBuilder sb = new StringBuilder(data.length);
 				for (byte byteChar : data) {
-           if(byteChar != 0x00 ){
-	           char c = (char) (byteChar & 0xFF);
-	           sb.append(c);
-           }
+					if (byteChar != 0x00) {
+						char c = (char) (byteChar & 0xFF);
+						sb.append(c);
+					}
 				}
+				return sb.toString();
 
-
-//				final StringBuilder stringBuilder = new StringBuilder(data.length);
-//				for (byte byteChar : data) {
-//					stringBuilder.append(String.format("%02X ", byteChar));
-//				}
-//				intent.putExtra(EXTRA_DATA, new String(data) + "\n" + stringBuilder.toString());
-				intent.putExtra(EXTRA_DATA, sb.toString());
 			}
+		}
+
+		private void broadcastUpdate(final String action,
+		                             final BluetoothGattCharacteristic characteristic) {
+			final Intent intent = new Intent(action);
+		intent.putExtra(EXTRA_DATA, characteristicValue(characteristic));
+
 			sendBroadcast(intent);
 		}
 
@@ -120,16 +121,73 @@ public class BluetoothLeService extends Service {
 			Log.v(TAG, "onCharacteristicRead()");
 			if (status == BluetoothGatt.GATT_SUCCESS) {
 				Log.v(TAG, "Characteristic value: " + characteristic.getValue());
-				broadcastUpdate(ACTION_DATA_AVAILABLE, characteristic);
+				processCharacteristic(characteristic);
+				//broadcastUpdate(ACTION_DATA_AVAILABLE, characteristic);
 			}
 		}
 
 		@Override
 		public void onCharacteristicChanged(BluetoothGatt gatt,
 		                                    BluetoothGattCharacteristic characteristic) {
-			broadcastUpdate(ACTION_DATA_AVAILABLE, characteristic);
+		//	broadcastUpdate(ACTION_DATA_AVAILABLE, characteristic);
 		}
 	};
+	/**
+	 * Analyses the value and updates storage and UI.
+	 */
+	private void processCharacteristic(BluetoothGattCharacteristic characteristic) {
+
+		String message = null;
+		String data = characteristic.getStringValue(0);
+
+		if (data != null && data.length() > 0) {
+//			Log.v(TAG, "Value >>>" + data + "<<<");
+
+			//First character holds the type.
+			char dataType = data.charAt(0);
+			String dataContent = data.substring(1);
+
+			//Distance value: Number of wheel rotation
+			if (dataType == 'D') {
+
+				long value;
+
+				//Expecting the wheel rotation number as long value
+				try {
+					value = Long.valueOf(dataContent);
+					dodDistanceValue = value;
+					dodLastUpdateAt = System.currentTimeMillis();
+//					Log.v(TAG, "Value=" + dodDistanceValue);
+
+				} catch (Exception e) {
+					Log.v(TAG, "Caught exception: Not a long value >>>" + dataContent + "<<<");
+					message = "Not a number >>>" + dataContent + "<<<";
+				}
+			}
+			// Message
+			else if (dataType == 'M') {
+				Log.v(TAG, "Received message: " + dataContent);
+				message = dataContent;
+			}
+
+			//Unknown type
+			else {
+				Log.v(TAG, "Received value with unknown type: " + dataContent);
+				message = "Unknown value:" + dataContent;
+			}
+		}
+
+		// Invalid message
+		else {
+			Log.v(TAG, "Received invalid message >>>" + data + "<<<");
+			message = "Invalid message:" + data;
+		}
+
+		if (message != null) {
+			messageBox.add(message);
+		}
+
+	}
 
 	private BluetoothManager mBluetoothManager;
 	private BluetoothAdapter mBluetoothAdapter;
