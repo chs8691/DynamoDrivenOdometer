@@ -46,7 +46,7 @@ void loop(void) {
   distanceValue++;
 
   //Send data over BLE
-  sendData(distanceValue);
+  bltSendData(distanceValue);
   
   //Send message 
 // sendMessage("HELLO_RFDUINO");

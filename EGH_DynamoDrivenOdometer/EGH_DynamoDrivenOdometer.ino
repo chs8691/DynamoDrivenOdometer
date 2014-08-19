@@ -1,6 +1,13 @@
 /*
    Bike Distance Counter
 
+TODO:
+- Am Trigger Pin liegt die Eingangspannung des Board an. Warum? Hier muss doch 0 anliegen.
+  Die gemessene Spannung nach Dynamo-Stopp ist nicht die der Rücklicht-Spannung
+- Der Pull-Down Widerstand vom Reed ist mit 300 Ohm eigentlich zu niedrig. Das
+  könnte sich negativ auf die Spannungsstabilität des Board auswirken.
+- Der Schreibvorgang klappt nicht
+
    Features:
    - Needs no battery, just bike dynamo and power support
      of the buffered front light
@@ -31,23 +38,31 @@ const int TRIGGER_PIN = 1;    // select the input pin for the potentiometer
 ////////////////////////////////////////////////////////
 // Actual Distance value as ticks (rotation counter)
 long counter;
-long lastSavedCounter;
+long counterStart;
 
 // True, if a hard error occured
 boolean error;
+boolean valueRead;
+
+long nextReadTry;
+
+//Set to TURE, when value wrote to card.
+boolean wrote;
 
 // Temp return value of an method call.
 int ret = 0;
 
 // TRUE, when SD card is online
 boolean cardOn;
-// Try periodically to open SD card
-long cardNextBeginRetry;
 
+//Last error Message
 String errorMessage;
 
 // In error case count for next sending
 boolean errorSend;
+
+//Just for debugging
+long nextTickMillis;
 
 /******************************************************
   Setup
@@ -56,198 +71,103 @@ void setup()
 {
 
   // Open serial communications for debug and pc controlling
-  sloSetup(true);
+  sloSetup(true); //Disable serial logging
   counter = 0;
-  lastSavedCounter = 0;
+  counterStart = 0;
 
   error = false;
   errorMessage = "-";
   errorSend = false;
-
+  valueRead = false;
+  nextReadTry = 1000; //Starting point for card reading
   cardOn = false;
+  wrote = false;
+  nextTickMillis = 0;
 
   // Initialize the modules
   lecSetup(LED);
-  bltSetup("UP");
   rstSetup(REED);
   psmSetup(TRIGGER_PIN);
+  etpSetup();
+  bltSetup("UP");
 
-  cardNextBeginRetry = millis() + 1000;
-
-  //  Serial.println("End of setup()");
 }
 /******************************************************
   Loop
 /******************************************************/
 void loop(void) {
 
-  //Card module needs more time to come up
-  //Retry until successful connected
-  if (!cardOn && millis() > cardNextBeginRetry) {
-    ret = etpSetup();
-    if (ret == 0) {
-      //Add stored value to actual turns
-      counter += etpGetOldDistance();
-      lastSavedCounter = etpGetOldDistance();
-      cardOn = true;
-      lecBlink();
-    }
-    else
-      //Wait a second to try it again
-      cardNextBeginRetry = millis() + 1000;
-  }
+  if (!error) {
 
-
-  // Normal mode
-  else {
-
-    //Count wheels rotations and send to app
-    if (rstRead()) {
-      counter++;
-      lecFlash();
-      bltSendData(counter);
+    // Number of retries to much: Cancel reading and
+    // switch to error mode
+    if (!etpCheckReadRetry()) {
+      error = true;
+      errorMessage = "ERROR_SD_INIT";
+      bltSendMessage(errorMessage);
+      lecIntervalStart();
+      sloLogB("etpCheckReadRetryOverflow: error. Set error", error);
+      return;
     }
 
-    //Save to card when power breaks down
-    if (psmCheck() && counter != lastSavedCounter) {
-      if (cardOn) {
-        ret = etpWrite(counter);
-        if (ret == 0)
-          lecBlink();
-        else
-        { lecIntervalStart();
-          error = true;
-          errorMessage = etpErrorToString(ret);
+    // Card reading not finished
+    // Try it every tick
+    if (!valueRead && (millis() >= nextReadTry)) {
+      // Next try to read from card
+      if (etpReadValue()) {
+        sloLogL("Reading succesful, found value", etpGetDistance());
+        valueRead = true;
+        lecBlink();
+        //Done. Add stored value to actual counter.
+        counter += etpGetDistance();
+        counterStart = counter;
+      }
+      else {
+        nextReadTry = millis() + 1000; //Try it again after one second
+        sloLogS("Reading not successful");
+      }
+    }
+
+
+    /*
+        //Save to card when power breaks down
+        //TEST: Write every 10 ticks
+        if (!wrote && valueRead && counter != counterStart && (counter % 10) == 0) {
+    //    if (!wrote && valueRead && psmCheck()) {
+          wrote = true;
+          ret = etpWrite(counter);
+          if (ret == 0) {
+            lecBlink();
+            sloLogS("Wrote successful");
+          }
+          else {
+            lecIntervalStart();
+            error = true;
+            errorMessage = "ERROR_SD_WRITE";
+            bltSendMessage(errorMessage);
+            sloLogS("Writing error. Set errorMessage=" + errorMessage);
+          }
         }
-      }
-      else
-      { lecIntervalStart();
-        error = true;
-        errorMessage = "ERROR_CARD_NOT_INIT";
-      }
-    }
+    */
   }
+
+  //Count wheels rotations and send to app
+  // if((millis() % 1000)==0 && (millis() >= nextTickMillis)) //TEST Simulate reed
+  if (rstRead())
+  {
+    counter++;
+    wrote = false;
+    nextTickMillis = millis() + 10;
+    lecFlash();
+    bltSendData(counter);
+    sloLogL("Counter", counter);
+  }
+
   //Give LED the control
   lecControl();
-}
-/**********************************************************************/
-/**********************************************************************/
-/**********************************************************************/
-/*                                                                    */
-/*        Module BLT - Bluetooth LE Trasmitter                        */
-/*                                                                    */
-/*  Version 1.0, 11.08.2014                                           */
-/*  Sends a value via BT LE in the format char(28), closed with \0:   */
-/*  D<long>: a long number, for instance "D2147483647"                */
-/*  M<String>: a message,  for instance "MSD_READ_ERROR"              */
-/**********************************************************************/
-/**********************************************************************/
-/**********************************************************************/
-typedef struct {
-
-  //Temp. buffer with data
-  char buf[28];
-
-  // data string to send
-  String data;
-} Blt;
-Blt blt;
-
-// How often data will be send in milliseconds. Increase value to
-// save energy
-const int BLT_INTERVAL_MS = 1000;
-
-// Name of the device, appears in the advertising. Keep it short.
-const char* BLT_DEVICE_NAME = "DDO";
-
-/**********************************************************************
-   Initializes BLT module. Call this in setup().
-/*********************************************************************/
-void bltSetup(String welcomeMessage) {
-
-
-  //Set interval von BLE exchange //TODO Neede?
-  // RFduinoBLE.advertisementInterval = BLT_INTERVAL_MS;
-
-  //set the BLE device name as it will appear when advertising
-  RFduinoBLE.deviceName = BLT_DEVICE_NAME;
-
-  // start the BLE stack
-  RFduinoBLE.begin();
-
-  //Initialize send data
-  bltSendMessage(welcomeMessage);
-}
-
-/**********************************************************************
-  Sends a long value as distance message, e.g. "D12345". Character
-  'D' will be add as prefix.
-/*********************************************************************/
-void bltSendData(long value) {
-
-  // Send actual distance
-  blt.data = "D" + String(value) + String('\0');
-
-  blt.data.toCharArray(blt.buf, 28);
-  RFduinoBLE.send(blt.buf, 28);
 
 }
 
-/**********************************************************************
-  Sends message, e.g. "MERROR_SD_CARD_WRITE"
-  String message Message text with < 26 characters, without lead 'M'.
-/*********************************************************************/
-void bltSendMessage(String message) {
-
-  // Send actual distance
-  blt.data = "M" + message + String('\0');
-
-  blt.data.toCharArray(blt.buf, 28);
-  RFduinoBLE.send(blt.buf, 28);
-
-}
-/**********************************************************************/
-/**********************************************************************/
-/**********************************************************************/
-/*                                                                    */
-/*        Module LOG - A simple logger                                */
-/*                                                                    */
-/*  Version 1.6, 11.08.2014                                           */
-/**********************************************************************/
-/**********************************************************************/
-/**********************************************************************/
-typedef struct {
-  //True, if logging to serial out
-  boolean serialSwitch;
-} SLO;
-SLO slo;
-/***********************************************************************
-     Initializes the module. Call this in the setup().
-************************************************************************/
-
-int sloSetup(boolean serialSwitch) {
-  slo.serialSwitch = serialSwitch;
-  if(slo.SerialSwitch()
-    Serial.begin(9600);
-}
-
-void sloLogS(String text) {
-  if (slo.serialSwitch)
-    Serial.println(text);
-}
-
-void sloLogL(String text, long value) {
-  if (slo.serialSwitch) {
-    Serial.print(text + ": ");
-    Serial.println(value);
-  }
-}
-void sloLogB(String text, boolean value) {
-  if (slo.serialSwitch) {
-    Serial.print(text + ": ");
-    Serial.println(value);
-  }
-}
 /**********************************************************************/
 /**********************************************************************/
 /**********************************************************************/
@@ -275,31 +195,16 @@ ETP etp;
 const int ETP_GPIO_CHIP_SELECT = 6;
 
 // Card error occured
-const int ETP_ERROR_NR_READ_RETRIES = 1;
 const int ETP_ERROR_WRITING = 2;
 const int ETP_ERROR_MAX_FILE_NR_REACHED = 3;
 
-//How often card reading can tried
-const int ETP_MAX_NR_READ_RETRIES = 3;
+//How often card reading will be tried
+const int ETP_MAX_NR_READ_RETRIES = 100;
 
 //Biggest supported file number
 const int ETP_MAX_FILE_NR = 10;
 
 const long ETP_NULL = -1;
-
-String etpErrorToString(int error) {
-  if (error == ETP_ERROR_NR_READ_RETRIES)
-    return "ETP_ERROR_NR_READ_RETRIES";
-
-  if (error == ETP_ERROR_WRITING)
-    return "ETP_ERROR_WRITING";
-
-  if (error == ETP_ERROR_MAX_FILE_NR_REACHED)
-    return "ETP_ERROR_MAX_FILE_NR_REACHED";
-
-  return "ERROR_UNKNOWN";
-
-}
 
 /**********************************************************************
    Returns value from file or, if not read, 0.
@@ -345,8 +250,7 @@ int etpWrite(long value) {
   String strValue = String(value);
   byte bytes = 0;
 
-  logL("etpWrite() with value", value);
-
+  sloLogL("etpWrite() with value", value);
 
   goOn = true;
   fNr = 0;
@@ -357,7 +261,7 @@ int etpWrite(long value) {
     //avoid overflow
     if (fNr >= ETP_MAX_FILE_NR)
     {
-      log("Cancel with ETP_ERROR_MAX_FILE_NR_REACHED");
+      sloLogS("Cancel with ETP_ERROR_MAX_FILE_NR_REACHED");
       return ETP_ERROR_MAX_FILE_NR_REACHED;
     }
 
@@ -366,11 +270,11 @@ int etpWrite(long value) {
 
     //Skip file of etp.oldDistance
     if (fNr == etp.lastFilenumber) {
+      sloLogL("Skip old file nr", fNr);
       fNr++;
-      logL("Skip old file nr", fNr);
     }
 
-    logL("Search file nr", fNr);
+    sloLogL("Search file nr", fNr);
 
     //First try: nok-File
     fName = String(fNr);
@@ -378,31 +282,32 @@ int etpWrite(long value) {
 
     if (etpPrepareFileForCreating(cfName))
     {
-      log("free file place " + fName);
+      sloLogS("free file place " + fName);
       //Let's try ok-File
       fName = String(fNr) + ".ok";
       fName.toCharArray(cfName, 11);
       if (etpPrepareFileForCreating(cfName)) {
-        log("free file place, end while: " + fName);
+        sloLogS("free file place, end while: " + fName);
         goOn = false;
       } else
-        log("file exists: " + fName);
+        sloLogS("file exists: " + fName);
     } else
-      log("file exists: " + fName);
+      sloLogS("file exists: " + fName);
 
   }
 
   //Now we have found a not existing filename
   myFile = SD.open(cfName, FILE_WRITE);
   if (myFile) {
-    log("File opend for writing: " + fName);
-    log("Write value: " + strValue);
+    sloLogS("File opend for writing: " + fName);
+    sloLogS("Write value: " + strValue);
     bytes = myFile.println(strValue);
     myFile.close();
-    logL("Wrote byte number", bytes);
+    sloLogL("Wrote byte number", bytes);
+    return 0;
   }
   else {
-    log("Could not open file for writing. Returning ETP_ERROR_WRITE: " + fName);
+    sloLogS("Could not open file for writing. Returning ETP_ERROR_WRITE: " + fName);
     return ETP_ERROR_WRITING;
   }
 
@@ -421,14 +326,14 @@ int etpSetup() {
 }
 
 /***********************************************************************
-     Checks if card read may retries. Returns 0 if, retry is possible
+     Checks if card read may retries. Returns TRUE if, retry is possible
      otherwise FALSE. Call this in loop() to device if readValue() may
      be called once again.
 ************************************************************************/
-int etpCheckReadRetryOverflow() {
+boolean etpCheckReadRetry() {
   if (etp.nrReadRetries >= ETP_MAX_NR_READ_RETRIES)
-    return ETP_ERROR_NR_READ_RETRIES;
-  else return 0;
+    return false;
+  else return true;
 }
 
 /***********************************************************************
@@ -439,7 +344,7 @@ int etpCheckReadRetryOverflow() {
 ************************************************************************/
 boolean etpReadValue() {
 
-  log("etpReadValue()");
+  sloLogS("etpReadValue()");
   int ret = 0;
   boolean goOn;
   File next;
@@ -459,17 +364,17 @@ boolean etpReadValue() {
   if (etp.nrReadRetries < ETP_MAX_NR_READ_RETRIES)
     etp.nrReadRetries++;
 
-  logL("Nr of retries", etp.nrReadRetries);
+  sloLogI("Nr of retries", etp.nrReadRetries);
 
   //Card initializtion must be done
   if (!etp.sdBegin) {
     if (!SD.begin(ETP_GPIO_CHIP_SELECT)) {
-      log("SD.begin() false, leave etpReadValue()");
+      sloLogS("SD.begin() false, leave etpReadValue()");
       return false;
     }
     else {
       etp.sdBegin = true;
-      log("SD.begin() true");
+      sloLogS("SD.begin() true");
     }
   }
 
@@ -478,7 +383,7 @@ boolean etpReadValue() {
   // Results are: stored value and file name
   // for next storing.
   ///////////////////////////////////////////////////////////////
-  log("Entering while");
+  sloLogS("Entering while");
   while (goOn) {
 
     // File to search("1", "2", "3" etc.)
@@ -486,11 +391,11 @@ boolean etpReadValue() {
     //Filename to search for, "1.ok", "2.ok" etc.
     fName = String(fNr) + ".ok";
     fName.toCharArray(cfName, 11);
-    // log("Searching for file: " + fName);
+    sloLogS("Searching for file: " + fName);
 
     // File exist
     if (SD.exists(cfName)) {
-      //log("Found");
+      sloLogS("Found");
 
       // Try to open file
       fName.toCharArray(cfName, 11);
@@ -498,13 +403,13 @@ boolean etpReadValue() {
 
       // File ok, can be opend
       if (f) {
-        //log("Opened " + fName);
+        sloLogS("Opened " + fName);
         // We found the value
         value1 = etpReadFile(f);
         if (value1 != ETP_NULL && value1 > etp.oldDistance) {
-          //logL("Set etp.LastFilenumber: ", fNr);
+          //sloLogI("Set etp.LastFilenumber: ", fNr);
           etp.lastFilenumber = fNr;
-          // logL("Set etp.oldDistance: ", value1);
+          //sloLogL("Set etp.oldDistance: ", value1);
           etp.oldDistance = value1;
         }
       }
@@ -513,9 +418,10 @@ boolean etpReadValue() {
 
     // File doesn't exist
     else  {
-      //   logL("File doesn't exist, finish searching. fNr", fNr);
+      sloLogS("File doesn't exist, finish searching");
       //Found no file: Counter starts with '0'
       if (value1 == ETP_NULL) {
+        sloLogS("No file with value found, set value and filenumber to 0");
         value1 = 0;
         etp.oldDistance = value1;
         etp.lastFilenumber = 0;
@@ -525,8 +431,8 @@ boolean etpReadValue() {
     }
   }
 
-  logL("Set etp.LastFilenumber", fNr);
-  logL("Set etp.oldDistance", value1);
+  sloLogI("Set etp.LastFilenumber", etp.lastFilenumber);
+  sloLogL("Set etp.oldDistance", etp.oldDistance);
 
   //Yeah, Success!
   return true;
@@ -632,7 +538,7 @@ long etpGetOldDistance() {
 /*  only be started once and there can only run on program at once.   */
 /*  There is priority order between the programs:                     */
 /*  Prio 1: Interval on/off: flashing slowly                          */
-/*  Prio 2: Quick blinking for 5 times.                               */
+/*  Prio 2: One blinking for 5 long time.                             */
 /*  Prio 3: Single flash.                                             */
 /**********************************************************************/
 /**********************************************************************/
@@ -648,7 +554,8 @@ typedef struct {
 } Lec;
 Lec lec;
 
-const int LEC_BLINK_MS = 50;
+//const int LEC_BLINK_MS = 50;
+const int LEC_BLINK_MS = 750;
 const int LEC_INTERVAL_MS = 500;
 
 /**********************************************************************
@@ -703,7 +610,7 @@ void lecBlink() {
 
 
   //Start blink
-  lec.counter = 5;
+  lec.counter = 1;
   lec.endMs = millis() + LEC_BLINK_MS;
   lec.ledStatus = 1;
   lec.blnk = true;
@@ -722,8 +629,8 @@ void lecFlash() {
 
 
   //Start flash
-  lec.endMs = millis() + 100;
-  Serial.println(millis());
+  lec.endMs = millis() + 50;
+  sloLogL("time", millis());
   lec.ledStatus = 1;
   lec.flash = true;
   digitalWrite(lec.gpio, lec.ledStatus);
@@ -1018,4 +925,129 @@ void rstSetup(int gpioReed) {
   rst.gpio = gpioReed;
   pinMode(rst.gpio, INPUT);
 }
+/**********************************************************************/
+/**********************************************************************/
+/**********************************************************************/
+/*                                                                    */
+/*        Module BLT - Bluetooth LE Trasmitter                        */
+/*                                                                    */
+/*  Version 1.0, 11.08.2014                                           */
+/*  Sends a value via BT LE in the format char(28), closed with \0:   */
+/*  D<long>: a long number, for instance "D2147483647"                */
+/*  M<String>: a message,  for instance "MSD_READ_ERROR"              */
+/**********************************************************************/
+/**********************************************************************/
+/**********************************************************************/
+typedef struct {
 
+  //Temp. buffer with data
+  char buf[28];
+
+  // data string to send
+  String data;
+} Blt;
+Blt blt;
+
+// How often data will be send in milliseconds. Increase value to
+// save energy
+const int BLT_INTERVAL_MS = 1000;
+
+// Name of the device, appears in the advertising. Keep it short.
+const char* BLT_DEVICE_NAME = "DDO";
+
+/**********************************************************************
+   Initializes BLT module. Call this in setup().
+/*********************************************************************/
+void bltSetup(String welcomeMessage) {
+
+
+  //Set interval von BLE exchange //TODO Neede?
+  // RFduinoBLE.advertisementInterval = BLT_INTERVAL_MS;
+
+  //set the BLE device name as it will appear when advertising
+  RFduinoBLE.deviceName = BLT_DEVICE_NAME;
+
+  // start the BLE stack
+  RFduinoBLE.begin();
+
+  //Initialize send data
+  bltSendMessage(welcomeMessage);
+}
+
+/**********************************************************************
+  Sends a long value as distance message, e.g. "D12345". Character
+  'D' will be add as prefix.
+/*********************************************************************/
+void bltSendData(long value) {
+
+  // Send actual distance
+  blt.data = "D" + String(value) + String('\0');
+
+  blt.data.toCharArray(blt.buf, 28);
+  RFduinoBLE.send(blt.buf, 28);
+
+}
+
+/**********************************************************************
+  Sends message, e.g. "MERROR_SD_CARD_WRITE"
+  String message Message text with < 26 characters, without lead 'M'.
+/*********************************************************************/
+void bltSendMessage(String message) {
+
+  // Send actual distance
+  blt.data = "M" + message + String('\0');
+
+  blt.data.toCharArray(blt.buf, 28);
+  RFduinoBLE.send(blt.buf, 28);
+
+}
+/**********************************************************************/
+/**********************************************************************/
+/**********************************************************************/
+/*                                                                    */
+/*        Module SLO - A simple logger                                */
+/*                                                                    */
+/*  Version 1.6, 11.08.2014                                           */
+/**********************************************************************/
+/**********************************************************************/
+/**********************************************************************/
+typedef struct {
+  //True, if logging to serial out
+  boolean serialSwitch;
+} SLO;
+SLO slo;
+/***********************************************************************
+     Initializes the module. Call this in the setup().
+************************************************************************/
+
+int sloSetup(boolean serialSwitch) {
+  slo.serialSwitch = serialSwitch;
+  if (slo.serialSwitch) {
+    Serial.begin(9600);
+    sloLogS("SLO says hello !");
+  }
+}
+
+void sloLogS(String text) {
+  if (slo.serialSwitch)
+    Serial.println(text);
+}
+
+void sloLogI(String text, int value) {
+  if (slo.serialSwitch) {
+    Serial.print(text + ": ");
+    Serial.println(value);
+  }
+}
+void sloLogL(String text, long value) {
+  if (slo.serialSwitch) {
+    Serial.print(text + ": ");
+    Serial.println(value);
+  }
+}
+void sloLogB(String text, boolean value) {
+  if (slo.serialSwitch) {
+    Serial.print(text + ": ");
+    Serial.println(value);
+  }
+}
