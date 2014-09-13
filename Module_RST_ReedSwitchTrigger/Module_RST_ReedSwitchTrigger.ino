@@ -3,7 +3,7 @@
   Controls the LED toggled by the reed switch.
 
   Proparation:
-  - Reed switch on 3V+ and GPIO 0, Pull down resistor with 320 OHM
+  - Reed switch on 3V+ and GPIO 0, Pull down resistor with ca. 50 k OHM
   - LED on GPIO 1
  */
 
