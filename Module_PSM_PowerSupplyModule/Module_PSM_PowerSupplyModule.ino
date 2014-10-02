@@ -1,5 +1,7 @@
 /*
 
+  Demo setting for module PSM. USB board may not bo connected (TX = GPIO1).
+
  The circuit:
  - LED an GPIO2
  - Analog signal < 3 V on GPIO1
@@ -14,6 +16,8 @@ long nextSerial = 0;
 
 long timer = 0; // LED on timer
 
+boolean on;
+
 void setup() {
   // declare the ledPin as an OUTPUT:
   pinMode(ledPin, OUTPUT);
@@ -24,10 +28,17 @@ void setup() {
   digitalWrite(ledPin, LOW);
 //  Serial.println("Hallo Cord!!!");
 
+  on = false;
+
   timer = 0;
 
   //Initialize Power Supply Module
   psmSetup(TRIGGER_PIN);
+  
+  digitalWrite(ledPin, HIGH);
+  delay(250);
+  digitalWrite(ledPin, LOW);
+ 
 }
 
 void loop() {
@@ -35,10 +46,15 @@ void loop() {
   if (psmCheck()) {
     digitalWrite(ledPin, HIGH);
     timer = millis() + 1000;
+    on = true;
   }
 
-  if (millis() > timer)
+  //Reset 
+  if (on && millis() > timer){
     digitalWrite(ledPin, LOW);
+    psmReset();
+    on = false;
+  }
 
 }
 /**********************************************************************/
@@ -46,7 +62,7 @@ void loop() {
 /**********************************************************************/
 /*                      Power Supply Module                           */
 /*                                                                    */
-/*  Version 1.0, 11.08.2014                                           */
+/*  Version 1.1, 11.08.2014                                           */
 /* Secondary voltage signal on analog input for controlling power     */
 /* fade out. There is a bycicle dynamo who powers the B&M LED front   */
 /* light- Lumotec IQ. The B&M has two outputs: One is the LED power,  */
@@ -117,6 +133,7 @@ const int PSM_UP_COUNT_LIMIT = 10000;
 // The trigger voltage must be above this value to increment the upCount.
 // Decrease this, if the upCount doesn't reach the UP_COUNT_MIN.
 // Increase this, if there is not enough voltage when the powerCheck() fires.
+//const int PSM_UP_THRESHOLD = 980;
 const int PSM_UP_THRESHOLD = 980;
 
 
@@ -165,8 +182,16 @@ boolean psmCheck() {
   return psm.ret;
 
 }
+
 /**
-  Initialize power supply module. Call this once in startup().
+  Can be used to reset after psmCheck() has fired.
+*/
+void psmReset(){
+  psmSetup(psm.triggerPin);  
+}
+
+/**
+  Initialize power supply module. Must be called once in startup(). 
   triggerPin: GPIO with the voltage trigger signal
 */
 void psmSetup(int triggerPin) {
