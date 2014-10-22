@@ -1,11 +1,11 @@
 /*
    Bike Distance Counter
 
+Hinweise:
+- GPIO1 kann nicht als Trigger-Pin verwendet werden, wenn USB-Modul aufegestekt ist, da
+  es für TX verwendet wird -> Zum USB-Test ohne SD-Module an einem freien Port testen.
+
 TODO:
-- Am Trigger Pin liegt die Eingangspannung des Board an. Warum? Hier muss doch 0 anliegen.
-  Die gemessene Spannung nach Dynamo-Stopp ist nicht die der Rücklicht-Spannung
-- Der Pull-Down Widerstand vom Reed ist mit 300 Ohm eigentlich zu niedrig. Das
-  könnte sich negativ auf die Spannungsstabilität des Board auswirken.
 - Der Schreibvorgang klappt nicht
 
    Features:
@@ -40,8 +40,11 @@ const int TRIGGER_PIN = 1;    // select the input pin for the potentiometer
 long counter;
 long counterStart;
 
-// True, if a hard error occured
+// True, if a hard error occured. If device falls into error==true,
+// the device has to be restarted by interrupting power supply.
 boolean error;
+
+// True, if saved distance value was read from card successfully
 boolean valueRead;
 
 long nextReadTry;
@@ -71,7 +74,8 @@ void setup()
 {
 
   // Open serial communications for debug and pc controlling
-  sloSetup(true); //Disable serial logging
+  sloSetup(false); //Disable serial logging
+  //  sloSetup(false); //Enable serial logging
   counter = 0;
   counterStart = 0;
 
@@ -98,69 +102,80 @@ void setup()
 void loop(void) {
 
   if (!error) {
+    
+        // Number of card reading retries to much: Cancel reading and
+        // switch to error mode
+        if (!etpCheckReadRetry()) {
+          error = true;
+          errorMessage = "ERROR_SD_INIT";
+          bltSendMessage(errorMessage);
+          lecIntervalStart();
+          sloLogB("etpCheckReadRetryOverflow: error. Set error", error);
+          return;
+        }
 
-    // Number of retries to much: Cancel reading and
-    // switch to error mode
-    if (!etpCheckReadRetry()) {
-      error = true;
-      errorMessage = "ERROR_SD_INIT";
-      bltSendMessage(errorMessage);
-      lecIntervalStart();
-      sloLogB("etpCheckReadRetryOverflow: error. Set error", error);
-      return;
-    }
-
-    // Card reading not finished
-    // Try it every tick
-    if (!valueRead && (millis() >= nextReadTry)) {
-      // Next try to read from card
-      if (etpReadValue()) {
-        sloLogL("Reading succesful, found value", etpGetDistance());
-        valueRead = true;
-        lecBlink();
-        //Done. Add stored value to actual counter.
-        counter += etpGetDistance();
-        counterStart = counter;
-      }
-      else {
-        nextReadTry = millis() + 1000; //Try it again after one second
-        sloLogS("Reading not successful");
-      }
-    }
-
-
-    /*
-        //Save to card when power breaks down
-        //TEST: Write every 10 ticks
-        if (!wrote && valueRead && counter != counterStart && (counter % 10) == 0) {
-    //    if (!wrote && valueRead && psmCheck()) {
-          wrote = true;
-          ret = etpWrite(counter);
-          if (ret == 0) {
+        // Card reading not finished
+        // Try it every tick
+        if (!valueRead && (millis() >= nextReadTry)) {
+          // Next try to read from card
+          if (etpReadValue()) {
+            sloLogL("Reading succesful, found value", etpGetDistance());
+            valueRead = true;
             lecBlink();
-            sloLogS("Wrote successful");
+            //Done. Add stored value to actual counter.
+            counter += etpGetDistance();
+            counterStart = counter;
           }
           else {
-            lecIntervalStart();
-            error = true;
-            errorMessage = "ERROR_SD_WRITE";
-            bltSendMessage(errorMessage);
-            sloLogS("Writing error. Set errorMessage=" + errorMessage);
+            nextReadTry = millis() + 1000; //Try it again after one second
+            sloLogS("Reading not successful");
           }
         }
-    */
-  }
 
-  //Count wheels rotations and send to app
-  // if((millis() % 1000)==0 && (millis() >= nextTickMillis)) //TEST Simulate reed
-  if (rstRead())
-  {
-    counter++;
-    wrote = false;
-    nextTickMillis = millis() + 10;
-    lecFlash();
-    bltSendData(counter);
-    sloLogL("Counter", counter);
+/*
+
+            //Save to card when power breaks down
+
+            //if (!wrote && valueRead && counter != counterStart && (counter % 10) == 0) {//TEST: Write every 10 ticks
+            if (!wrote && valueRead && psmCheck()) {
+              wrote = true;
+
+
+              ret = true; //TEST: Simulate writing
+    //          ret = etpWrite(counter);
+
+              // Wrote distance value to card successfully
+              if (ret == 0) {
+                // Give short signal to the user
+                lecBlink();
+                // Initialize power supply module for next time
+                psmReset();
+                sloLogS("Wrote successful");
+              }
+
+              // Error occured, let device fall into error state
+              else {
+                lecIntervalStart();
+                error = true;
+                errorMessage = "ERROR_SD_WRITE";
+                bltSendMessage(errorMessage);
+                sloLogS("Writing error. Set errorMessage=" + errorMessage);
+              }
+            }
+    */
+
+
+    //Count wheels rotations and send to app
+    // if((millis() % 1000)==0 && (millis() >= nextTickMillis)) //TEST Simulate reed
+    if (rstRead())
+    {
+      counter++;
+      wrote = false;
+      nextTickMillis = millis() + 10;
+      lecFlash();
+      bltSendData(counter);
+      sloLogL("Counter", counter);
+    }
   }
 
   //Give LED the control
@@ -199,7 +214,7 @@ const int ETP_ERROR_WRITING = 2;
 const int ETP_ERROR_MAX_FILE_NR_REACHED = 3;
 
 //How often card reading will be tried
-const int ETP_MAX_NR_READ_RETRIES = 100;
+const int ETP_MAX_NR_READ_RETRIES = 3;
 
 //Biggest supported file number
 const int ETP_MAX_FILE_NR = 10;
@@ -596,7 +611,7 @@ void lecIntervalStop() {
 
 
 /**********************************************************************
-  Flashes the LED for five times. Priority 2. lecControl() must be
+  Light up the LED for 750 ms. Priority 2. lecControl() must be
   called within the loop().
 /*********************************************************************/
 void lecBlink() {
@@ -701,12 +716,13 @@ void lecSetup(int gpioLed) {
   lec.counter = 0;
   pinMode(lec.gpio, OUTPUT);
 }
+
 /**********************************************************************/
 /**********************************************************************/
 /**********************************************************************/
 /*                      Power Supply Module                           */
 /*                                                                    */
-/*  Version 1.0, 11.08.2014                                           */
+/*  Version 1.1, 11.08.2014                                           */
 /* Secondary voltage signal on analog input for controlling power     */
 /* fade out. There is a bycicle dynamo who powers the B&M LED front   */
 /* light- Lumotec IQ. The B&M has two outputs: One is the LED power,  */
@@ -777,6 +793,7 @@ const int PSM_UP_COUNT_LIMIT = 10000;
 // The trigger voltage must be above this value to increment the upCount.
 // Decrease this, if the upCount doesn't reach the UP_COUNT_MIN.
 // Increase this, if there is not enough voltage when the powerCheck() fires.
+//const int PSM_UP_THRESHOLD = 980;
 const int PSM_UP_THRESHOLD = 980;
 
 
@@ -825,8 +842,16 @@ boolean psmCheck() {
   return psm.ret;
 
 }
+
 /**
-  Initialize power supply module. Call this once in startup().
+  Can be used to reset after psmCheck() has fired.
+*/
+void psmReset() {
+  psmSetup(psm.triggerPin);
+}
+
+/**
+  Initialize power supply module. Must be called once in startup().
   triggerPin: GPIO with the voltage trigger signal
 */
 void psmSetup(int triggerPin) {
@@ -854,7 +879,6 @@ void psmSetup(int triggerPin) {
   //  digitalWrite(psm.triggerPin, LOW);
 
 }
-
 
 /**********************************************************************/
 /**********************************************************************/
@@ -1020,6 +1044,10 @@ SLO slo;
      Initializes the module. Call this in the setup().
 ************************************************************************/
 
+/**********************************************************************
+   Initializes SLO module. Call this in setup().
+   Boolean serialSwitch True enables serial logging, false disables it.
+/**********************************************************************/
 int sloSetup(boolean serialSwitch) {
   slo.serialSwitch = serialSwitch;
   if (slo.serialSwitch) {

@@ -1,7 +1,7 @@
 /*
 Lesen: Ermitteln der gespeicherten Entfernung.
 Es gibt immer eine Datei, in der der aktulle Wert zu finden ist. Der Datename ist eine Zahl,
-sie hat die Endung ".ok" ( Fehlt die Datei beim ersten Ausführen, so wird wird sie später angelegt).
+sie hat die Endung ".ok" ( Fehlt die Datei beim ersten Ausführen, so wird sie später angelegt).
 Es wird berücksichtigt, dass der Schreibvorgang unvollständig bleibt (Spannungsquelle
 bricht weg). Die Datei kann dann nicht mehr bearbeitet werden, evtl. ist der Inhalt auf nicht
 korrekt. Deshalb erfolgt das Schreiben zweistufig: Zuerst wird die Datei geschrieben, dannach
@@ -42,16 +42,18 @@ boolean demoEnd;
 long counter;
 long counterStart;
 boolean error;
+long tick;
+
 /******************************************************
   Setup
 /******************************************************/
 void setup()
 {
-
-  // Open serial communications for debug and pc controlling
-  sloSetup(true);
-
+  sloSetup(true); //Set TRUE for Serial logging, FALSE for no logging
   pinMode(LED, OUTPUT);
+  digitalWrite(LED, LOW);
+
+  tick = millis() + 1000;
 
   int ret = 0;
   etpSetup();
@@ -60,10 +62,6 @@ void setup()
   error = false;
   counter = 0;
   counterStart = counter;
-  //LOG Serial.println("End of setup()");
-  digitalWrite(LED, LOW);
-  //--------- Just TEST --------------
-
 }
 /******************************************************
   Loop
@@ -75,34 +73,51 @@ void loop(void) {
     // switch to error mode
     if (etpCheckReadRetryOverflow() > 0) {
       error = true;
+      sloLogL("millis=" , millis());
       sloLogB("etpCheckReadRetryOverflow: error. Set error", error);
+      //     digitalWrite(LED, LOW);
       return;
     }
 
     // Card reading not finished
-    if (!valueRead)
+    if (!valueRead && millis() > tick)
       // Next try to read from cord
       if (etpReadValue()) {
+        sloLogL("millis=" , millis());
         sloLogL("Reading succesful, found value", etpGetDistance());
         valueRead = true;
         //Done. Add stored value to actual counter.
         counter += etpGetDistance();
         counterStart = counter;
       }
-      else
+      else {
+        sloLogL("millis=" , millis());
         sloLogS("Reading not successful");
-
+      }
     // Simulate reed
-    counter++;
+    if (millis() > tick) {
+      counter++;
+      tick = millis() + 1000;
+    }
 
 
     //Simulate End of session / power down
     if (counter > counterStart && valueRead) {
+      sloLogL("millis=" , millis());
       sloLogL("Calling etpWrite with", counter );
-      etpWrite(counter);
+      int res = etpWrite(counter);
+      if (res == 0) {
+        sloLogL("millis=" , millis());
+        sloLogS("etpWrite successfull !!!!");
+        digitalWrite(LED, HIGH);
+      } else {
+        sloLogL("etpWrite error ", res);
+      }
       demoEnd = true;
     }
+
   }
+
 }
 
 /**********************************************************************/
@@ -176,7 +191,7 @@ const int ETP_GPIO_CHIP_SELECT = 6;
 // Card error occured
 const int ETP_ERROR_NR_READ_RETRIES = 1;
 const int ETP_ERROR_WRITING = 2;
-const int ETP_ERROR_MAX_FILE_NR_REACHED = 3;
+const int ETP_ERROR_MAX_FILE_NR_REACHED = 5;
 
 //How often card reading can tried
 const int ETP_MAX_NR_READ_RETRIES = 3;
@@ -284,11 +299,12 @@ int etpWrite(long value) {
       if (etpPrepareFileForCreating(cfName)) {
         sloLogS("free file place, end while: " + fName);
         goOn = false;
-      } else
+      } else {
         sloLogS("file exists: " + fName);
-    } else
+      }
+    } else {
       sloLogS("file exists: " + fName);
-
+    }
   }
 
   //Now we have found a not existing filename
@@ -305,6 +321,7 @@ int etpWrite(long value) {
     return ETP_ERROR_WRITING;
   }
 
+  return 0;
 
 }
 
@@ -385,7 +402,7 @@ boolean etpReadValue() {
     //Filename to search for, "1.ok", "2.ok" etc.
     fName = String(fNr) + ".ok";
     fName.toCharArray(cfName, 11);
-    // sloLogS("Searching for file: " + fName);
+    sloLogS("Searching for file: " + fName);
 
     // File exist
     if (SD.exists(cfName)) {
@@ -403,7 +420,7 @@ boolean etpReadValue() {
         if (value1 != ETP_NULL && value1 > etp.oldDistance) {
           //logL("Set etp.LastFilenumber: ", fNr);
           etp.lastFilenumber = fNr;
-          // sloLogL("Set etp.oldDistance: ", value1);
+          sloLogL("Set etp.oldDistance: ", value1);
           etp.oldDistance = value1;
         }
       }
@@ -412,7 +429,7 @@ boolean etpReadValue() {
 
     // File doesn't exist
     else  {
-      //   sloLogL("File doesn't exist, finish searching. fNr", fNr);
+      sloLogL("File doesn't exist, finish searching. fNr", fNr);
       //Found no file: Counter starts with '0'
       if (value1 == ETP_NULL) {
         value1 = 0;
