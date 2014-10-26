@@ -1,6 +1,12 @@
 void setup() {
   // put your setup code here, to run once:
    sloSetup(true);
+      sloLogUL("Unsigned long = ", 4294967295 );
+      sloLogL("Unsigned long = ", 4294967295 ); //ERROR
+      sloLogUI("Unsigned int = ", 4294967295 );
+      sloLogI("Int = ", 4294967295 );
+      sloLogUI("Unsigned Int = ", -2147483648 );
+      sloLogI("Int = ", -2147483648 );
 }
 
 void loop() {
@@ -27,7 +33,6 @@ SLO slo;
 /***********************************************************************
      Initializes the module. Call this in the setup().
 ************************************************************************/
-
 int sloSetup(boolean serialSwitch) {
   slo.serialSwitch = serialSwitch;
   if(slo.serialSwitch)
@@ -39,12 +44,23 @@ void sloLogS(String text) {
     Serial.println(text);
 }
 
+// For number types unsigned long and unsigned int
+void sloLogUL(String text, unsigned long value) {
+  if (slo.serialSwitch) {
+    Serial.print(text + ": ");
+    Serial.println(value);
+  }
+}
+
+// For number types long and int
 void sloLogL(String text, long value) {
   if (slo.serialSwitch) {
     Serial.print(text + ": ");
     Serial.println(value);
   }
 }
+
+//For boolean
 void sloLogB(String text, boolean value) {
   if (slo.serialSwitch) {
     Serial.print(text + ": ");
