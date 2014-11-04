@@ -1,0 +1,82 @@
+Memory organization
+===================
+
+ - For every value one page (à 64 Byte) is used ( There are 4096  
+   pages on the 24AA256)                                          
+ - A value can be a data or a address (index)                     
+ - A index address is a two Byte value (Word)                     
+ - A data value is a 4 Byte value (unsigned int)                  
+ - Highest Byte is written first, then second highest one etc.    
+ - Every value will be written twice into a page-pair             
+ - A value is valid, if both values of a pair are equal           
+ - A data page will only be used for up to 1,000,000 (1E6) writes       
+  (EEPROM limit of writes), max. value is 2^32 - 1 (unsigned long) 
+ - Pages are organized in rooms: e.g. Develop, Test, Live et      
+ - A room has following pages (as pairs):                         
+    - Page 00..01 Index for data address                          
+    - Page 02..03 data values between 0 .. 1E6 - 1                
+    - Page 04..05 data values between 1E6 .. 2E6 - 1 etc.         
+
+Durability and limits
+=====================
+
+Requirements / maximum values: 
+- Every second one write access
+- Maximum distance value = 200.000 km
+
+Lifetime: 1 bank: 1E6 seconds -> 100 banks: 1,157 days runtime
+	
+EEPROM structure
+================
+
+The EEPROM's pages are grouped into three Parts with different number of pages.
+
+      EEPROM ______________________________  
+     | Unused  | Configuration | Room      |
+	 | 0..99   | 100..199      | 200..4095 |
+      -------------------------------------  
+
+Unsed        : Free for for developing and test.
+Configuration: For configuration values (wheel diameter etc.). (Later release)
+Room         :  For distance ticks (In a later release uptime in seconds and distance values can be added)	  
+
+Room
+----	   
+
+A page holds only one VALUE. The value can be an index or a data value. It is a unsigned long and will be stored in the first 4 Bytes of the page. The remaining Bytes 5 to 64 Bytes will be unused.
+1 Page = 64 Byte
+
+      Page __________________________________________________________
+     |  Value _____________________________  Unused _______________  |
+     | | Byte 0 | Byte 1 | Byte 2 | Byte 3 | Byte 4 | .. | Byte 63 | |
+     |  -----------------------------------------------------------  |
+      ---------------------------------------------------------------
+
+The value will be stored two times redundant in a PAIR. 
+1 Pair = 2 Pages. 
+   
+      Pair ____________  
+     | Page 1 | Page 2 | 
+      -----------------  
+
+
+A BANK has two pairs: one for the actual value and one for the previous one. Only the actual pair will be changed. The untouched one is for fallback. 
+1 Bank = 4 Pages.
+   
+      Bank __________________________________
+     |  Pair 0 __________ Pair 1 __________  |
+	 | | Page 1 | Page 2 | Page 1 | Page 2 | |
+     |  ----------------- -----------------	 |
+      ---------------------------------------
+
+
+The room has 974 banks ((4095 - 200) / 4) and holds index and values of the complete application. So we have 1 index bank and 973 data banks.
+A index bank hold the number of the actual data bank (1 .. 973).
+A data bank will be used to write the changed value for 1 million times (1E6). After that, the next bank has to be used. In sum we can write 973E6 times to the EEPROM. Values to
+be stored are unsigned long values (0..4,294,967,295). If every second a value would be written, the max. lifetime is 31 years. If the distance would be stored in meters, the max. lifetime is 4,294,967 km. 
+
+       Room ___________________________________________
+      | Index bank | Data bank 1 | ... | Data bank 973 |
+       ------------------------------------------------
+
+	   
