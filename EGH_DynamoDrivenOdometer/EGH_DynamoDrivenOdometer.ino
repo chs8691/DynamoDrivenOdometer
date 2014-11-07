@@ -1,62 +1,37 @@
 /*
    Bike Distance Counter
 
-Hinweise:
-- GPIO1 kann nicht als Trigger-Pin verwendet werden, wenn USB-Modul aufegestekt ist, da
-  es für TX verwendet wird -> Zum USB-Test ohne SD-Module an einem freien Port testen.
-
-TODO:
-- Der Schreibvorgang klappt nicht
 
    Features:
    - Needs no battery, just bike dynamo and power support
      of the buffered front light
-   - Read the actual wheel rotation and store it on SD card
+   - Read the actual wheel rotation and store it on EEPROM
    - Communicate the value via Bluetooth 4.0 to the Android App
-
-
 
  */
 
-// include the SD library:
-#include <SPI.h>
-#include <SD.h>
+// Needed by BLT
 #include <RFduinoBLE.h>
 
-
+// Needed by MEM
+#include <Wire.h>
 
 ////////////////////////////////////////////////////////
 // GPIO 0 ..6 definition
 ////////////////////////////////////////////////////////
-const int LED = 2;
-const int REED = 0;
-const int TRIGGER_PIN = 1;    // select the input pin for the potentiometer
-
+const int LED = 3;
+const int REED = 2;
 
 ////////////////////////////////////////////////////////
 // Variable declarations
 ////////////////////////////////////////////////////////
-// Actual Distance value as ticks (rotation counter)
-long counter;
-long counterStart;
 
 // True, if a hard error occured. If device falls into error==true,
 // the device has to be restarted by interrupting power supply.
 boolean error;
 
-// True, if saved distance value was read from card successfully
-boolean valueRead;
-
-long nextReadTry;
-
-//Set to TURE, when value wrote to card.
-boolean wrote;
-
 // Temp return value of an method call.
 int ret = 0;
-
-// TRUE, when SD card is online
-boolean cardOn;
 
 //Last error Message
 String errorMessage;
@@ -64,36 +39,32 @@ String errorMessage;
 // In error case count for next sending
 boolean errorSend;
 
-//Just for debugging
-long nextTickMillis;
-
 /******************************************************
   Setup
 /******************************************************/
 void setup()
 {
+  unsigned long value = 0;
+  byte pairNr = 0;
 
   // Open serial communications for debug and pc controlling
-  sloSetup(false); //Disable serial logging
+  sloSetup(true); //Disable serial logging
   //  sloSetup(false); //Enable serial logging
-  counter = 0;
-  counterStart = 0;
+
 
   error = false;
   errorMessage = "-";
   errorSend = false;
-  valueRead = false;
-  nextReadTry = 1000; //Starting point for card reading
-  cardOn = false;
-  wrote = false;
-  nextTickMillis = 0;
 
   // Initialize the modules
   lecSetup(LED);
   rstSetup(REED);
-  psmSetup(TRIGGER_PIN);
-  etpSetup();
+  memSetup();
   bltSetup("UP");
+
+  errorMessage = "IDX: " + String(memGetIndexValue()) + " " + String(memGetIndexPairNr());
+  sloLogS(errorMessage);
+  bltSendMessage(errorMessage);
 
 }
 /******************************************************
@@ -101,446 +72,796 @@ void setup()
 /******************************************************/
 void loop(void) {
 
-  if (!error) {
-    
-        // Number of card reading retries to much: Cancel reading and
-        // switch to error mode
-        if (!etpCheckReadRetry()) {
-          error = true;
-          errorMessage = "ERROR_SD_INIT";
-          bltSendMessage(errorMessage);
-          lecIntervalStart();
-          sloLogB("etpCheckReadRetryOverflow: error. Set error", error);
-          return;
-        }
-
-        // Card reading not finished
-        // Try it every tick
-        if (!valueRead && (millis() >= nextReadTry)) {
-          // Next try to read from card
-          if (etpReadValue()) {
-            sloLogL("Reading succesful, found value", etpGetDistance());
-            valueRead = true;
-            lecBlink();
-            //Done. Add stored value to actual counter.
-            counter += etpGetDistance();
-            counterStart = counter;
-          }
-          else {
-            nextReadTry = millis() + 1000; //Try it again after one second
-            sloLogS("Reading not successful");
-          }
-        }
-
-/*
-
-            //Save to card when power breaks down
-
-            //if (!wrote && valueRead && counter != counterStart && (counter % 10) == 0) {//TEST: Write every 10 ticks
-            if (!wrote && valueRead && psmCheck()) {
-              wrote = true;
-
-
-              ret = true; //TEST: Simulate writing
-    //          ret = etpWrite(counter);
-
-              // Wrote distance value to card successfully
-              if (ret == 0) {
-                // Give short signal to the user
-                lecBlink();
-                // Initialize power supply module for next time
-                psmReset();
-                sloLogS("Wrote successful");
-              }
-
-              // Error occured, let device fall into error state
-              else {
-                lecIntervalStart();
-                error = true;
-                errorMessage = "ERROR_SD_WRITE";
-                bltSendMessage(errorMessage);
-                sloLogS("Writing error. Set errorMessage=" + errorMessage);
-              }
-            }
-    */
-
-
-    //Count wheels rotations and send to app
-    // if((millis() % 1000)==0 && (millis() >= nextTickMillis)) //TEST Simulate reed
-    if (rstRead())
-    {
-      counter++;
-      wrote = false;
-      nextTickMillis = millis() + 10;
-      lecFlash();
-      bltSendData(counter);
-      sloLogL("Counter", counter);
-    }
-  }
-
-  //Give LED the control
-  lecControl();
-
-}
-
-/**********************************************************************/
-/**********************************************************************/
-/**********************************************************************/
-/*                                                                    */
-/*        Module ETP - Error Tolerance Persisting to SD Card          */
-/*                                                                    */
-/*  Version 1.1, 11.08.2014                                           */
-/*  There are two files: one with the actual and one with the         */
-/*  previous value. Only the new one will be touched. If an error     */
-/*  occurs, there is always the oder one as fallback.                 */
-/**********************************************************************/
-/**********************************************************************/
-/**********************************************************************/
-typedef struct {
-  //TRUE, when SD card connected with SD.begin()
-  // (SD.begin() returns TRUE only one time)
-  boolean sdBegin;
-  long oldDistance;
-  int lastFilenumber;
-  int nrReadRetries;
-} ETP;
-ETP etp;
-
-// RFDuino: Chip select is GPIO 6
-const int ETP_GPIO_CHIP_SELECT = 6;
-
-// Card error occured
-const int ETP_ERROR_WRITING = 2;
-const int ETP_ERROR_MAX_FILE_NR_REACHED = 3;
-
-//How often card reading will be tried
-const int ETP_MAX_NR_READ_RETRIES = 3;
-
-//Biggest supported file number
-const int ETP_MAX_FILE_NR = 10;
-
-const long ETP_NULL = -1;
-
-/**********************************************************************
-   Returns value from file or, if not read, 0.
-***********************************************************************/
-long etpGetDistance() {
-  return etp.oldDistance;
-}
-
-/**********************************************************************
-  Checks, if file exists and removes it. Availability of SD Card
-  will not be checked.
-  Returns true, if file doesn't exists (anymore), otherwise false;
-***********************************************************************/
-boolean etpPrepareFileForCreating(char * cfName) {
-
-  // File exist
-  if (SD.exists(cfName)) {
-    SD.remove(cfName);
-    if (!SD.exists(cfName)) {
-      //Yeah! Let's take this filename
-      return true;
-    }
-  }
-  else {
-    //Yeah! Let's take this filename
-    return true;
-  }
-  // File exists and could not be removed.
-  return false;
-}
-
-/**********************************************************************
-  Writes actual distance to file. Return 0 if successfull or otherwise
-  error code ETP_ERROR_WRITE.
-***********************************************************************/
-int etpWrite(long value) {
-
-  boolean goOn;
-  int fNr;
-  String fName;
-  char cfName[11];
-  File myFile;
-  String strValue = String(value);
-  byte bytes = 0;
-
-  sloLogL("etpWrite() with value", value);
-
-  goOn = true;
-  fNr = 0;
-
-  //Search for free filename. Remove existing but not actual files.
-  while (goOn) {
-
-    //avoid overflow
-    if (fNr >= ETP_MAX_FILE_NR)
-    {
-      sloLogS("Cancel with ETP_ERROR_MAX_FILE_NR_REACHED");
-      return ETP_ERROR_MAX_FILE_NR_REACHED;
-    }
-
-    // File to search("1", "2", "3" etc.)
-    fNr++;
-
-    //Skip file of etp.oldDistance
-    if (fNr == etp.lastFilenumber) {
-      sloLogL("Skip old file nr", fNr);
-      fNr++;
-    }
-
-    sloLogL("Search file nr", fNr);
-
-    //First try: nok-File
-    fName = String(fNr);
-    fName.toCharArray(cfName, 11);
-
-    if (etpPrepareFileForCreating(cfName))
-    {
-      sloLogS("free file place " + fName);
-      //Let's try ok-File
-      fName = String(fNr) + ".ok";
-      fName.toCharArray(cfName, 11);
-      if (etpPrepareFileForCreating(cfName)) {
-        sloLogS("free file place, end while: " + fName);
-        goOn = false;
-      } else
-        sloLogS("file exists: " + fName);
-    } else
-      sloLogS("file exists: " + fName);
-
-  }
-
-  //Now we have found a not existing filename
-  myFile = SD.open(cfName, FILE_WRITE);
-  if (myFile) {
-    sloLogS("File opend for writing: " + fName);
-    sloLogS("Write value: " + strValue);
-    bytes = myFile.println(strValue);
-    myFile.close();
-    sloLogL("Wrote byte number", bytes);
-    return 0;
-  }
-  else {
-    sloLogS("Could not open file for writing. Returning ETP_ERROR_WRITE: " + fName);
-    return ETP_ERROR_WRITING;
-  }
-
-
-}
-
-/***********************************************************************
-     Initializes the module. Call this in the setup().
-************************************************************************/
-int etpSetup() {
-  //Just initialize the vars
-  etp.oldDistance = 0;
-  etp.lastFilenumber = 0;
-  etp.nrReadRetries = 0;
-  etp.sdBegin = false;
-}
-
-/***********************************************************************
-     Checks if card read may retries. Returns TRUE if, retry is possible
-     otherwise FALSE. Call this in loop() to device if readValue() may
-     be called once again.
-************************************************************************/
-boolean etpCheckReadRetry() {
-  if (etp.nrReadRetries >= ETP_MAX_NR_READ_RETRIES)
-    return false;
-  else return true;
-}
-
-/***********************************************************************
-    Try to read the value by reading all *.ok-files. The file with the
-    'high score' wins. Must be called in loop() until TRUE is returned.
-    Sets etp.oldDistance and etp.lastFilenumber. Increases read retry
-    counter.
-************************************************************************/
-boolean etpReadValue() {
-
-  sloLogS("etpReadValue()");
-  int ret = 0;
-  boolean goOn;
-  File next;
-  int fNr;
-  String fName;
-  char cfName[11];
-  File f;
-
-  // Help vars
-  long value1 = ETP_NULL;
-  String fName1;
-
-  goOn = true;
-  fNr = 0;
-
-  //Increment retry counter (avoid overflow)
-  if (etp.nrReadRetries < ETP_MAX_NR_READ_RETRIES)
-    etp.nrReadRetries++;
-
-  sloLogI("Nr of retries", etp.nrReadRetries);
-
-  //Card initializtion must be done
-  if (!etp.sdBegin) {
-    if (!SD.begin(ETP_GPIO_CHIP_SELECT)) {
-      sloLogS("SD.begin() false, leave etpReadValue()");
-      return false;
-    }
-    else {
-      etp.sdBegin = true;
-      sloLogS("SD.begin() true");
-    }
-  }
-
-  ///////////////////////////////////////////////////////////////
-  // Loop directory and try to find last ok file and read its value.
-  // Results are: stored value and file name
-  // for next storing.
-  ///////////////////////////////////////////////////////////////
-  sloLogS("Entering while");
-  while (goOn) {
-
-    // File to search("1", "2", "3" etc.)
-    fNr++;
-    //Filename to search for, "1.ok", "2.ok" etc.
-    fName = String(fNr) + ".ok";
-    fName.toCharArray(cfName, 11);
-    sloLogS("Searching for file: " + fName);
-
-    // File exist
-    if (SD.exists(cfName)) {
-      sloLogS("Found");
-
-      // Try to open file
-      fName.toCharArray(cfName, 11);
-      f = SD.open(cfName);
-
-      // File ok, can be opend
-      if (f) {
-        sloLogS("Opened " + fName);
-        // We found the value
-        value1 = etpReadFile(f);
-        if (value1 != ETP_NULL && value1 > etp.oldDistance) {
-          //sloLogI("Set etp.LastFilenumber: ", fNr);
-          etp.lastFilenumber = fNr;
-          //sloLogL("Set etp.oldDistance: ", value1);
-          etp.oldDistance = value1;
-        }
-      }
-      f.close();
-    }
-
-    // File doesn't exist
-    else  {
-      sloLogS("File doesn't exist, finish searching");
-      //Found no file: Counter starts with '0'
-      if (value1 == ETP_NULL) {
-        sloLogS("No file with value found, set value and filenumber to 0");
-        value1 = 0;
-        etp.oldDistance = value1;
-        etp.lastFilenumber = 0;
-      }
-      // End searching
-      goOn = false;
-    }
-  }
-
-  sloLogI("Set etp.LastFilenumber", etp.lastFilenumber);
-  sloLogL("Set etp.oldDistance", etp.oldDistance);
-
-  //Yeah, Success!
-  return true;
-
-}
-/**
-Read file content as long value. IF file could not be opend or
-value is no long type, ETP_NULL will be returnd. File must
-be opend and will not be closed.
-*/
-long etpReadFile(File myFile) {
-  char fChar;
-  String line = "0";
-  long value = ETP_NULL;
-  // read first line from the file, ignore the rest:
-  while (myFile.available()) {
-    fChar = myFile.read();
-
-    //Exit after first line
-    if (fChar == '\n')
-      break;
-    line.concat(fChar);
-  }
-
-  value = stringToLong(line);
-  if (value >= 0)
-    return value;
-  else
-    return ETP_NULL;
-}
-
-/**********************************************************************
-Converts a String to long. Non-digit characates
-will be ignored.
-***********************************************************************/
-long stringToLong(String digits) {
-  char next = ' - ';
-  int i = 0;
-  int factor = 1;
-  long ret = 0;
-
-
-  for (int j = digits.length() - 1; j >= 0; j--)
+  //Count wheels rotations and send to app
+  // if((millis() % 1000)==0 && (millis() >= nextTickMillis)) //TEST Simulate reed
+  if (rstRead())
   {
-    next = digits.charAt(j);
-    switch (next) {
-      case '0':
-        i = 0;
-        break;
-      case '1':
-        i = 1;
-        break;
-      case '2':
-        i = 2;
-        break;
-      case '3':
-        i = 3;
-        break;
-      case '4':
-        i = 4;
-        break;
-      case '5':
-        i = 5;
-        break;
-      case '6':
-        i = 6;
-        break;
-      case '7':
-        i = 7;
-        break;
-      case '8':
-        i = 8;
-        break;
-      case '9':
-        i = 9;
-        break;
-      default:
-        i = -1;
-    }
-    if (i >= 0) {
-      ret = ret + (factor * i);
-      factor = factor * 10;
-    }
+    memTick();
+    lecFlash();
+   bltSendData(memGetCounter());
+    sloLogUL("Counter=", memGetCounter());
   }
 
-  return ret;
+
+  //Let MEM make its stuff
+  memControl();
+
+  //Let LEC make its stuff
+  lecControl();
+  /*
+    if (!error) {
+
+          // Number of card reading retries to much: Cancel reading and
+          // switch to error mode
+          if (!etpCheckReadRetry()) {
+            error = true;
+            errorMessage = "ERROR_SD_INIT";
+            bltSendMessage(errorMessage);
+            lecIntervalStart();
+            sloLogB("etpCheckReadRetryOverflow: error. Set error", error);
+            return;
+          }
+
+          // Card reading not finished
+          // Try it every tick
+          if (!valueRead && (millis() >= nextReadTry)) {
+            // Next try to read from card
+            if (etpReadValue()) {
+              sloLogL("Reading succesful, found value", etpGetDistance());
+              valueRead = true;
+              lecBlink();
+              //Done. Add stored value to actual counter.
+              counter += etpGetDistance();
+              counterStart = counter;
+            }
+            else {
+              nextReadTry = millis() + 1000; //Try it again after one second
+              sloLogS("Reading not successful");
+            }
+          }
+  */
+  /*
+
+              //Save to card when power breaks down
+
+              //if (!wrote && valueRead && counter != counterStart && (counter % 10) == 0) {//TEST: Write every 10 ticks
+              if (!wrote && valueRead && psmCheck()) {
+                wrote = true;
+
+
+                ret = true; //TEST: Simulate writing
+      //          ret = etpWrite(counter);
+
+                // Wrote distance value to card successfully
+                if (ret == 0) {
+                  // Give short signal to the user
+                  lecBlink();
+                  // Initialize power supply module for next time
+                  psmReset();
+                  sloLogS("Wrote successful");
+                }
+
+                // Error occured, let device fall into error state
+                else {
+                  lecIntervalStart();
+                  error = true;
+                  errorMessage = "ERROR_SD_WRITE";
+                  bltSendMessage(errorMessage);
+                  sloLogS("Writing error. Set errorMessage=" + errorMessage);
+                }
+              }
+      */
+
+
+
+
+}
+/**********************************************************************/
+/**********************************************************************/
+/**********************************************************************/
+/*                                                                    */
+/*      Module MEM - Error Tolerance Persisting for 24AA256           */
+/*                                                                    */
+/*  Version 1.0, 05.11.2014                                           */
+/*  Write an read one unsigned integer value to the external memory.  */
+/*  Only increasing values are supported (new value to be written     */
+/*  must be greate than the stored one.                               */
+/*  The storage is protected against broken power supply while        */
+/*  writing. There are 2 * 2 pages in use to store the value. One     */
+/*  page pair holds the acutal value and the other page pair holds    */
+/*  the previous one. While reading, both values of a pair must       */
+/*  be equal to be valid. The pair with the greater value will be     */
+/*  returned. While writing, the new value overwrites the older pair  */
+/*  (the pair with the lower value). The value will be stored on both */
+/*  value places of an pair.                                          */
+/*  This mechanism protects against corrupt writing. A value must be  */
+/*  written twice to be valid. Only if the second writing was done,   */
+/*  the value is 'valid'. Not valid pairs will be handled as          */
+/*  value == 0.                                                       */
+/*  Medule restrictions:                                              */
+/*   - Only for 24xx256 EEPROM from Microchip                         */
+/*   - Only one chip supported, wired to A2 = A1 = A0 = GND           */
+/*   - Only page writing supported                                    */
+/*   - Only values from 0 .. UNSIGNED_LONG_MAX - 1 are supported.     */
+/*   - memDo() must be called periodically in loop():                 */
+/*      There is a latency time of 6 ms between every transaction,    */
+/*      so transactions will be buffered and handled in cycles. No    */
+/*      delay is used.                                                */
+/*   - Check with memCheck() before using memWrite() memRead()        */
+
+/**********************************************************************/
+/**********************************************************************/
+/**********************************************************************/
+// Values of a Bank
+
+typedef byte MemProgram;
+typedef byte MemTask;
+
+typedef struct {
+  unsigned long a1;
+  unsigned long a2;
+  unsigned long b1;
+  unsigned long b2;
+} MemBank;
+
+// Valid value and its source
+struct MemValidValue {
+  unsigned long value;
+  byte pairNr;   //0: Pair 0, 1: Pair 1, 2: No pair
+};
+
+typedef struct {
+
+  // actual value of the counter
+  unsigned long counter;
+
+  // Last read value from memory
+  unsigned long oldValue;
+
+  // Absolute address of the actual data value (Page 1 of the pair)
+  // Read from index in the room. Address must be inside the room.
+  //(Must be a 2 Byte value with integer multiple of MEM_PAGE_SIZE)
+  struct MemValidValue index;
+
+  // Stored data value
+  struct MemValidValue data;
+
+  // to make shure, that te copy has the same value
+  unsigned long writeCounter;
+
+  // Index for writing data. Will be set in a program.
+  unsigned long writeIndexValue;
+
+  //PairNr to write to
+  byte writePairNr;
+
+  // Verifying: data value after writing. Temp. used in a program.
+  struct MemValidValue writtenValue;
+
+  // Delay after page write must be 6 ms and counter will be
+  // updated ever second.
+  unsigned long timer;
+
+  //Next time in milliseconds to check counter
+  unsigned long timerCounter;
+
+  // Program to do
+  MemProgram program;
+
+  // Upcoming task
+  MemTask task;
+
+  //FALSE, if there is a task to do and the task is not done. Otherwise TRUE;
+  boolean taskDone;
+
+  //Address to to room (first byte)
+  unsigned int roomAddress;
+
+} Mem;
+Mem mem;
+
+
+// Should be an int for Wire.beginTransmission
+const int MEM_SLAVE_ADDRESS = 0x50; //1010000 Address of the chip for writing
+
+// Page size in Byte: 64 Bytes per page
+const unsigned int MEM_PAGE_SIZE = 64;
+
+// A pair has two pages
+const unsigned int MEM_PAIR_SIZE = 2 * MEM_PAGE_SIZE; // 128
+
+// A bank has two pairs
+const unsigned int MEM_BANK_SIZE = 2 * MEM_PAIR_SIZE; // 256
+
+// Number of data banks
+const unsigned int MEM_MAX_INDEX_BANK_NR = 973;
+
+// Size of unused part in banks
+// Set to 0 for a production EEPROM. Set to 1..99 for developing.
+const unsigned int MEM_UNUSED_BANKS = 0;
+
+// Size of fixed part in pages for configuration values (further release)
+// Set to 100 for further releases
+const unsigned int MEM_CONFIGURATION_BANKS = 0;
+
+// Offset for first page of room part (in pages)
+const unsigned int MEM_ROOM_BANK_OFFSET = MEM_UNUSED_BANKS + MEM_CONFIGURATION_BANKS;
+
+// A data bank may only be used for 1 millon writes per pair. To be on the safe side,
+// a bank should be used only 1 million times.
+const unsigned long MEM_MAX_BANK_WRITINGS = 1000000L;
+
+// Needed for filter this values (EEPROM's bytes are initialized with 0xFF)
+const unsigned long MEM_MAX_UNSIGNED_LONG = 4294967295;
+
+// Latency time between two writes in milliseconds
+const unsigned long MEM_TIMER_INTERVALL_MS = 0;
+
+// pairNr can be 0 or 1. If no pair found, it will be set to NULL
+const byte MEM_PAIR_NULL = 255;
+
+//--- Programs: A program runs a set of task for writing data to the memory
+// Dummy program
+const MemProgram MEM_PROGRAM_NULL = 0;
+
+// Normal data writing of the actual counter value
+const MemProgram MEM_PROGRAM_WRITE_DATA = 1;
+
+// After max. write cycles into a page, we have to increment the bank
+const MemProgram MEM_PROGRAM_SWITCH_BANK = 2;
+
+//--- Tasks: A task is a single step in a program
+// Dummy-task
+const MemTask MEM_TASK_NULL = 0;
+
+// Write data value
+const MemTask MEM_TASK_WRITE_DATA = 1;
+
+// Wait after write (EEPROM needs time for it)
+const MemTask MEM_TASK_WRITE_DATA_WAIT = 2;
+
+// Write copy of the data value
+const MemTask MEM_TASK_COPY_DATA = 3;
+
+// Wait after write (EEPROM needs time for it)
+const MemTask MEM_TASK_COPY_DATA_WAIT = 4;
+
+// Read new written data value and check them
+const MemTask MEM_TASK_VERIFY_WRITTEN_DATA = 5;
+
+// Write data value
+const MemTask MEM_TASK_WRITE_INDEX = 6;
+
+// Wait after write (EEPROM needs time for it)
+const MemTask MEM_TASK_WRITE_INDEX_WAIT = 7;
+
+// Write copy of the data value
+const MemTask MEM_TASK_COPY_INDEX = 8;
+
+// Wait after write (EEPROM needs time for it)
+const MemTask MEM_TASK_COPY_INDEX_WAIT = 9;
+
+// Read new written data value and check them
+const MemTask MEM_TASK_VERIFY_WRITTEN_INDEX = 10;
+
+/***********************************************************************
+     Returns valid index. Internal use only.
+************************************************************************/
+struct MemValidValue memReadIndex() {
+
+  // Read memory
+  MemValidValue index = memReadBank(mem.roomAddress);
+
+  // in error case, init value
+  if (index.value < 1 || index.value > MEM_MAX_INDEX_BANK_NR) {
+    index.value = 1;
+    index.pairNr = MEM_PAIR_NULL; //Indicates that no valid pair was found
+  }
+
+  return index;
 }
 
-/**
-Returns the stored distance value read from file.
-*/
-long etpGetOldDistance() {
-  return etp.oldDistance;
+/***********************************************************************
+     Returns valid data. Internal use only.
+     Precondition: memReadIndex() called before.
+************************************************************************/
+struct MemValidValue memReadData(unsigned long index) {
+
+  // Read memory
+  MemValidValue data = memReadBank(mem.roomAddress + index * MEM_BANK_SIZE);
+
+  return data;
+
+}
+/***********************************************************************
+     Returns actual index pairNr.
+     Precondition: memSetup() must be called.
+************************************************************************/
+byte memGetIndexPairNr() {
+  return mem.index.pairNr;
+}
+/***********************************************************************
+     Returns actual index value.
+     Precondition: memSetup() must be called.
+************************************************************************/
+unsigned long memGetIndexValue() {
+  return mem.index.value;
+}
+
+/***********************************************************************
+     Returns actual value pairNr.
+     Precondition: memSetup() must be called.
+************************************************************************/
+byte memGetDataPairNr() {
+  return mem.data.pairNr;
+}
+
+/***********************************************************************
+     Returns actual data value. Precondition: memSetup() must be called.
+************************************************************************/
+unsigned long memGetDataValue() {
+  return mem.data.value;
+}
+
+/***********************************************************************
+     Returns value from memory or, if not found value == 0.
+     Internal use only.
+************************************************************************/
+struct MemValidValue memReadBank(unsigned int address) {
+
+  struct MemValidValue validValue;
+  MemBank bank;
+  boolean validA = false;
+  boolean validB = false;
+
+  // Read complete bank
+  bank.a1 = memReadSingle(address);
+  bank.a2 = memReadSingle(address + MEM_PAGE_SIZE);
+  bank.b1 = memReadSingle(address + 2 * MEM_PAGE_SIZE);
+  bank.b2 = memReadSingle(address + 3 * MEM_PAGE_SIZE);
+
+  //check for valid values
+  if (bank.a1 == bank.a2)
+    validA = true;
+
+  if (bank.b1 == bank.b2)
+    validB = true;
+
+  if (validA && validB) {
+    if (bank.a1 >= bank.b1)
+      validB = false;
+    else
+      validA = false;
+  }
+
+  if (validA) {
+    validValue.value = bank.a1;
+    validValue.pairNr = 0;
+  }
+  else if (validB) {
+    validValue.value = bank.b1;
+    validValue.pairNr = 1;
+  }
+  else {
+    validValue.value = 0;
+    validValue.pairNr = MEM_PAIR_NULL;  //Mark as 'Not valid'
+  }
+
+  return validValue;
+}
+
+/***********************************************************************
+     Returns a specific value as unsigned long from a bank.
+     MAX_UNSIGNED_LONG value will be returend as 0.
+     Internal use only.
+     Precondition: EEPROM not busy.
+************************************************************************/
+unsigned long memReadSingle(unsigned int address) {
+
+  unsigned long rdata = 0;
+  byte data[4];
+  byte i = 0;
+
+  Wire.beginTransmission(MEM_SLAVE_ADDRESS);
+  Wire.write((address >> 8) & 0xFF); //MSB of the address
+  Wire.write((address & 0xFF)); //LSB of the address
+  Wire.endTransmission();     // stop transmitting
+
+  // delay(5);
+  //  Wire.beginTransmission(MEM_SLAVE_ADDRESS);
+  Wire.requestFrom(MEM_SLAVE_ADDRESS, 4);
+
+  while (Wire.available() > 0) data[i++] = Wire.read();
+
+  rdata = ((long)data[0] << 24) + ((long)data[1] << 16) + ((long)data[2] << 8) + data[3];
+
+  //Bytes in EEPROM is initialized with 0xFF, treat them as '0'
+  if (rdata == MEM_MAX_UNSIGNED_LONG)
+    rdata = 0L;
+
+  return rdata;
+}
+
+/***********************************************************************
+     Impulse for counter. Call this in the loop for increasing
+     the counter value.
+************************************************************************/
+void memTick() {
+
+  // increase counter
+  mem.counter++;
+
+}
+
+/***********************************************************************
+     Returns acual counter value.
+************************************************************************/
+unsigned long memGetCounter() {
+
+  return mem.counter;
+
+}
+
+
+
+/***********************************************************************
+     Initializes the module. Call this once in the setup() as first
+     method of the module.
+     Returns TRUE, if memory was successful initialized, otherwise false.
+************************************************************************/
+boolean memSetup() {
+
+  // Just initialize the vars
+  mem.timer = 0;
+  mem.timerCounter = MEM_TIMER_INTERVALL_MS;
+  mem.program = MEM_PROGRAM_NULL;
+  mem.task = MEM_TASK_NULL;
+  mem.taskDone = true;
+  mem.counter = 0;
+  mem.writeCounter = 0;
+  mem.writeIndexValue = 0L;
+  mem.writePairNr = MEM_PAIR_NULL;
+  mem.writtenValue = {0, 0};
+
+  // join i2c bus
+  Wire.begin();
+
+  // address to the room
+  mem.roomAddress = MEM_ROOM_BANK_OFFSET * MEM_BANK_SIZE;
+
+  // Index adress is at the first place inside a room
+  mem.index = memReadIndex();
+
+
+  // Data bank address need an offset 1 because of the index bank
+  mem.data = memReadData(mem.index.value);
+
+  // Initialize counter with stored value
+  mem.counter = mem.data.value;
+
+  // Inequality is a trigger for writing
+  mem.writeCounter = mem.counter;
+
+  sloLogUL("mem.index.value", mem.index.value);
+  sloLogUL("mem.index.pairNr", mem.index.pairNr);
+  sloLogUL("mem.data.value", mem.data.value);
+  sloLogUL("mem.data.pairNr", mem.data.pairNr);
+
+}
+/***********************************************************************
+     Writes counter data to the memory pair. If asCopy==TRUE, the copy
+     will be written (Page 2), otherwise the data will be written to
+     Page 1. To complete writing, the method has to be called twice.
+     Precondition: EEPROM not busy.
+************************************************************************/
+void memWrite(boolean asCopy, byte pairNr, unsigned long index, //
+              unsigned long value) {
+
+  unsigned int address;
+
+  address = mem.roomAddress // Room
+            //            + (mem.index.value * MEM_BANK_SIZE) // Bank
+            + (index * MEM_BANK_SIZE) // Bank
+            +  (pairNr * MEM_PAIR_SIZE); //Pair
+
+  //Decide in which page inside the pair to write
+  if (asCopy) {
+    address += MEM_PAGE_SIZE;
+  }
+
+  //sloLogUL("Adress=", address);
+  //sloLogUL("Counter=", mem.writeCounter);
+
+  Wire.beginTransmission(MEM_SLAVE_ADDRESS);
+  Wire.write((address >> 8) & 0xFF); //MSB of the address
+  Wire.write((address & 0xFF)); //LSB of the address
+  Wire.write((byte) (value >> 24));
+  Wire.write((byte) (value >> 16));
+  Wire.write((byte) (value >> 8));
+  Wire.write((byte) value);
+  Wire.endTransmission();
+}
+/**********************************************************************
+  Mechanical stuff to write the value to memory within a task.
+  May only be called within an MEM_TASK_WRITE or MEM_TASK_COPY.
+/*********************************************************************/
+void writeTaskDoing(boolean asCopy, byte pairNr, unsigned long index, //
+                    unsigned long value) {
+  //  //Choose the pair to write, that holds not the actual value
+  //  if (pairNr == 0)
+  //    memWrite(asCopy, 1, index, value);
+  //  else
+  //    memWrite(asCopy, 0, index, value);
+  memWrite(asCopy, pairNr, index, value);
+
+  mem.timer = millis() + 6;
+  mem.timerCounter = millis() + MEM_TIMER_INTERVALL_MS;
+  mem.taskDone = true;
+}
+
+
+/**********************************************************************
+  Only for developing.
+/*********************************************************************/
+unsigned int memGetRoomAddress() {
+  return mem.roomAddress;
+}
+
+/**********************************************************************
+  Must be called within loop() to give MEM a change to update the
+  memory.
+  The program number will be returned.
+/*********************************************************************/
+byte memControl() {
+
+
+  // Controlling of programs an their tasks
+  switch (mem.program) {
+
+      // Normal write of data value to memory.
+    case MEM_PROGRAM_WRITE_DATA:
+      if (mem.taskDone) {
+        switch (mem.task) {
+          case MEM_TASK_WRITE_DATA:
+            //sloLogS("Starting MEM_TASK_WRITE_DATA_WAIT");
+            mem.task = MEM_TASK_WRITE_DATA_WAIT;
+            mem.taskDone = false;
+            break;
+          case MEM_TASK_WRITE_DATA_WAIT:
+            //sloLogS("Starting MEM_TASK_COPY_DATA");
+            mem.task = MEM_TASK_COPY_DATA;
+            mem.taskDone = false;
+            break;
+          case MEM_TASK_COPY_DATA:
+            //sloLogS("Starting MEM_TASK_COPY_DATA_WAIT");
+            mem.task = MEM_TASK_COPY_DATA_WAIT;
+            mem.taskDone = false;
+            break;
+          case MEM_TASK_COPY_DATA_WAIT:
+            //sloLogS("Starting MEM_TASK_COPY_DATA_WAIT");
+            mem.task = MEM_TASK_VERIFY_WRITTEN_DATA;
+            mem.taskDone = false;
+            //sloLogUL("Duration=", millis()-timer3);
+            break;
+          case MEM_TASK_VERIFY_WRITTEN_DATA:
+            //sloLogS("Program MEM_PROGRAM_WRITE_DATA finished.");
+            mem.program = MEM_PROGRAM_NULL;
+            mem.task = MEM_TASK_NULL;
+            mem.taskDone = false;
+            //digitalWrite(LED_GREEN, LOW)
+            //sloLogUL("Duration=", millis()-timer3);
+
+            //sloLogUL("mem.index.value=", mem.index.value);
+            //sloLogUL("mem.data.value", mem.data.value);
+            //Check for max write cycles into the bank and switch to next bank
+            //            if (mem.index.value * mem.data.value > MEM_MAX_BANK_WRITINGS) {
+            if (mem.data.value > (mem.index.value * MEM_MAX_BANK_WRITINGS)) {
+              //sloLogS("Starting MEM_PROGRAM_SWITCH_BANK");
+              mem.program = MEM_PROGRAM_SWITCH_BANK;
+              mem.task = MEM_TASK_WRITE_DATA;
+              mem.taskDone = false;
+              //Important: Write data value to next bank
+              mem.writeIndexValue++;
+
+              //Always write into first pair.
+              mem.writePairNr = 0;
+            }
+
+            break;
+        }
+      }
+      break;
+
+      // Program create a copy of the data value to the next bank.
+      // After that, for switching to this new bank, the index will
+      // be incremented.
+      // Precondition: MEM_PROGRAM_WRITE_DATA successfull executed.
+    case MEM_PROGRAM_SWITCH_BANK:
+      if (mem.taskDone) {
+        switch (mem.task) {
+          case MEM_TASK_WRITE_DATA:
+            //sloLogS("Starting MEM_TASK_WRITE_DATA_WAIT");
+            mem.task = MEM_TASK_WRITE_DATA_WAIT;
+            mem.taskDone = false;
+            break;
+          case MEM_TASK_WRITE_DATA_WAIT:
+            //sloLogS("Starting MEM_TASK_COPY_DATA");
+            mem.task = MEM_TASK_COPY_DATA;
+            mem.taskDone = false;
+            break;
+          case MEM_TASK_COPY_DATA:
+            //sloLogS("Starting MEM_TASK_COPY_DATA_WAIT");
+            mem.task = MEM_TASK_COPY_DATA_WAIT;
+            mem.taskDone = false;
+            break;
+          case MEM_TASK_COPY_DATA_WAIT:
+            //sloLogS("Starting MEM_TASK_VERIFY_WRITTEN_DATA");
+            mem.task = MEM_TASK_VERIFY_WRITTEN_DATA;
+            mem.taskDone = false;
+            //sloLogUL("Duration=", millis()-timer3);
+            break;
+          case MEM_TASK_VERIFY_WRITTEN_DATA:
+            //sloLogS("Starting MEM_TASK_WRITE_INDEX");
+            mem.task = MEM_TASK_WRITE_INDEX;
+            mem.taskDone = false;
+
+            //Toggle pair
+            if (mem.index.pairNr == 0)
+              mem.writePairNr = 1;
+            else
+              mem.writePairNr = 0;
+
+            //digitalWrite(LED_GREEN, LOW)
+            //sloLogUL("Duration=", millis()-timer3);
+            break;
+          case MEM_TASK_WRITE_INDEX:
+            //sloLogS("Starting MEM_TASK_WRITE_INDEX_WAIT");
+            mem.task = MEM_TASK_WRITE_INDEX_WAIT;
+            mem.taskDone = false;
+            break;
+          case MEM_TASK_WRITE_INDEX_WAIT:
+            //sloLogS("Starting MEM_TASK_COPY_INDEX");
+            mem.task = MEM_TASK_COPY_INDEX;
+            mem.taskDone = false;
+            break;
+          case MEM_TASK_COPY_INDEX:
+            //sloLogS("Starting MEM_TASK_COPY_INDEX_WAIT");
+            mem.task = MEM_TASK_COPY_INDEX_WAIT;
+            mem.taskDone = false;
+            break;
+          case MEM_TASK_COPY_INDEX_WAIT:
+            //sloLogS("Starting MEM_TASK_VERIFY_WRITTEN_INDEX");
+            mem.task = MEM_TASK_VERIFY_WRITTEN_INDEX;
+            mem.taskDone = false;
+            //sloLogUL("Duration=", millis()-timer3);
+            break;
+          case MEM_TASK_VERIFY_WRITTEN_INDEX:
+            //sloLogS("End of MEM_PROGRAM_SWITCH_BANK");
+            mem.program = MEM_PROGRAM_NULL;
+            mem.task = MEM_TASK_NULL;
+            mem.taskDone = false;
+            //digitalWrite(LED_GREEN, LOW)
+            //sloLogUL("Duration=", millis()-timer3);
+            break;
+        }
+      }
+      break;
+
+      //No program running. Start program with first task
+    default:
+      //Counter to write
+      if ( millis() > mem.timerCounter //
+           && mem.counter > mem.writeCounter) {
+        //sloLogS("Starting MEM_PROGRAM_WRITE_DATA");
+        mem.program = MEM_PROGRAM_WRITE_DATA;
+        mem.task = MEM_TASK_WRITE_DATA;
+        mem.taskDone = false;
+        mem.writeIndexValue = mem.index.value;
+        mem.writeCounter = mem.counter;
+
+        //Toggle Pair in the bank
+        if (mem.data.pairNr == 0)
+          mem.writePairNr = 1;
+        else
+          mem.writePairNr = 0;
+
+        //sloLogUL("mem.writeIndexValue=", mem.writeIndexValue);
+        //sloLogUL("mem.writeCounter=", mem.writeCounter);
+        //sloLogUL("mem.data.pairNr=", mem.data.pairNr);
+      }
+      break;
+  }
+
+  // Execution of task
+  if (!mem.taskDone)
+    switch (mem.task)
+    {
+      case MEM_TASK_WRITE_DATA_WAIT:
+      case MEM_TASK_COPY_DATA_WAIT:
+      case MEM_TASK_WRITE_INDEX_WAIT:
+      case MEM_TASK_COPY_INDEX_WAIT:
+        if (millis() > mem.timer)
+          mem.taskDone = true;
+        break;
+
+        //--- Verify written data that the pair is valid ----
+      case MEM_TASK_VERIFY_WRITTEN_DATA:
+        //sloLogS("Executing MEM_TASK_VERIFY_WRITTEN_DATA");
+
+        mem.writtenValue = memReadData(mem.writeIndexValue);
+        //sloLogUL("mem.writeIndexValue=", mem.writeIndexValue);
+        //sloLogUL("mem.writeCounter=", mem.writeCounter);
+        //sloLogUL("mem.writePairNr=", mem.writePairNr);
+
+        //sloLogUL("mem.writtenValue.pairNr=", mem.writtenValue.pairNr);
+        //sloLogUL("mem.writtenValue.value=", mem.writtenValue.value);
+
+        //When data like expected toggle pair for next writing
+        if (mem.writtenValue.value == mem.writeCounter &&
+            mem.writtenValue.pairNr == mem.writePairNr &&
+            mem.writtenValue.pairNr != MEM_PAIR_NULL) {
+          mem.data = mem.writtenValue;
+
+          //Temp Var no longer used
+          mem.writtenValue = {0, 0};
+          //sloLogS("Writing was OK. Set mem.data.");
+        }
+        else {
+          //digitalWrite(LED_RED, HIGH);
+          //sloLogS("MEM_TASK_VERIFY_WRITTEN_DATA: Writing was NOK !!!!");
+          mem.program = MEM_PROGRAM_NULL;
+          mem.task = MEM_TASK_NULL;
+          mem.taskDone = false;
+        }
+        mem.taskDone = true;
+        break;
+
+        //--- Create copy of counter value ----
+      case MEM_TASK_COPY_DATA:
+        writeTaskDoing(true, mem.writePairNr, mem.writeIndexValue, mem.writeCounter);
+        break;
+
+      case MEM_TASK_WRITE_DATA:
+        writeTaskDoing(false, mem.writePairNr, mem.writeIndexValue, mem.writeCounter);
+        break;
+
+      case MEM_TASK_VERIFY_WRITTEN_INDEX:
+        //sloLogS("Executing MEM_TASK_VERIFY_WRITTEN_INDEX");
+        mem.writtenValue = memReadBank(mem.roomAddress);
+        //sloLogUL("mem.writeIndexValue=", mem.writeIndexValue);
+        //sloLogUL("mem.writePairNr=", mem.writePairNr);
+
+        //sloLogUL("mem.writtenValue.pairNr=", mem.writtenValue.pairNr);
+        //sloLogUL("mem.writtenValue.value=", mem.writtenValue.value);
+
+        //When index like expected toggle pair for next writing
+        if (mem.writtenValue.value == mem.writeIndexValue &&
+            mem.writtenValue.pairNr == mem.writePairNr &&
+            mem.writtenValue.pairNr != MEM_PAIR_NULL) {
+          mem.index = mem.writtenValue;
+
+          //Temp Var no longer used
+          mem.writtenValue = {0, 0};
+          //sloLogS("Writing was OK. Set mem.data.");
+        }
+        else {
+          //digitalWrite(LED_RED, HIGH);
+          //sloLogS("MEM_TASK_VERIFY_WRITTEN_INDEX: Writing was NOK !!!!");
+          //Don't use this index, return to old one
+          mem.writeIndexValue = mem.index.value;
+        }
+        mem.taskDone = true;
+
+        break;
+      case MEM_TASK_COPY_INDEX:
+        writeTaskDoing(true, mem.writePairNr, 0, mem.writeIndexValue);
+        break;
+      case MEM_TASK_WRITE_INDEX:
+        writeTaskDoing(false, mem.writePairNr, 0, mem.writeIndexValue);
+        break;
+    }
+
+  return mem.program;
 }
 
 /**********************************************************************/
@@ -717,168 +1038,6 @@ void lecSetup(int gpioLed) {
   pinMode(lec.gpio, OUTPUT);
 }
 
-/**********************************************************************/
-/**********************************************************************/
-/**********************************************************************/
-/*                      Power Supply Module                           */
-/*                                                                    */
-/*  Version 1.1, 11.08.2014                                           */
-/* Secondary voltage signal on analog input for controlling power     */
-/* fade out. There is a bycicle dynamo who powers the B&M LED front   */
-/* light- Lumotec IQ. The B&M has two outputs: One is the LED power,  */
-/* a DC voltage limited to ~ 3.5 V and with a big capicator for stand */
-/* light support. This power will be used for powering the RFDuino.   */
-/* The second output of the B&M is for the taillight, it is the AC    */
-/* voltage of the dynamo and can be >> than 3.5 V. For the RFDuino    */
-/* this signal will be used for triggering the end of power. Be       */
-/* careful, the maximum input voltage of RFDuino is 3.6 V AC. It has  */
-/* to be limited and rectified.                                       */
-/**********************************************************************/
-/**********************************************************************/
-/**********************************************************************/
-// Variables for Powermanagement all starting with 'power'
-typedef struct {
-  long startTime;
-
-  // variable to store the value coming from the sensor
-  int triggerValue;
-
-  //GPIO of the voltage power in signal that is the trigger
-  int triggerPin;
-
-  // Temp var measures latency timer after power down for
-  // smoothing the voltage oscillation of the trigger signal
-  // (converted AC voltage)
-  long timer;
-
-  // Switch is true, if voltage drop has been communicated once
-  // psmCheck(). Otherwise false;
-  boolean fired;
-
-  // Counts number of trigger voltage above threshold. The
-  // psmCheck() only fires, if system is long enough 'up'
-  // since last fire. This avoids fireing at low voltage.
-  int upCount;
-
-  // Local variable for psmCheck()
-  boolean ret;
-
-} Psm;
-Psm psm;
-
-// Time between two measurement. Because the trigger signal is
-// a AC signal the normal sinus wave has to be compensated
-// The value depends of the dynamo's AC frequency per revolution
-// and the mininum velocity that has to be recognized
-// Minimum supported velocity: 3 km/h (0.83 m/s)
-// Shimano: ~ 10 1/revolution -> 166 ms
-const long PSM_LATENCY = 166;
-
-// Defines the analog input value the voltage must fall below for
-// fireing powerCheck() = true.
-// Increase the value if trigger signal has a very low voltage value
-const int PSM_THRESHOLD = 950;
-
-// Latency time in milliseconds before powerCheck() will fire for the first
-// time or for the next time after a powerCheck() returned true.
-// Increase the value if very short distances should not be stored.
-const int PSM_START_LATENCY_DURATION = 2000;
-
-// Number of high voltage trigger signals that have to be reached before
-// powerCheck() can fire.
-// Increase the value, if the system has to be up for a longer time before
-// next fireing.
-const int PSM_UP_COUNT_LIMIT = 10000;
-
-// The trigger voltage must be above this value to increment the upCount.
-// Decrease this, if the upCount doesn't reach the UP_COUNT_MIN.
-// Increase this, if there is not enough voltage when the powerCheck() fires.
-//const int PSM_UP_THRESHOLD = 980;
-const int PSM_UP_THRESHOLD = 980;
-
-
-/**
-  Returns for one time true, if power is going down, otherwise false.
-  For a latency time after setup and after fireing true
-  false will be returned.
-  Use this in the loop() to check when power breaks down.
-  Reads the analogInput of the trigger sginal.
-*/
-boolean psmCheck() {
-  //  Serial.println("psmCheck()");
-
-  psm.ret = false;
-
-  // Read trigger input
-  psm.triggerValue = analogRead(psm.triggerPin);
-  // Serial.println(analogRead(1));
-
-  // Check up criteria
-  if (psm.triggerValue >= PSM_UP_THRESHOLD && psm.upCount < PSM_UP_COUNT_LIMIT) {
-    psm.upCount ++;
-  }
-
-  // If trigger signal high, reset timer and switch
-  if (psm.triggerValue >= PSM_THRESHOLD) {
-    psm.timer = millis() + PSM_LATENCY;
-    psm.fired = false;
-  }
-
-  //Normal mode starts after 1 second up time
-  if (millis() > psm.startTime) {
-    // Check if trigger is low for latency time
-    if (psm.triggerValue < PSM_THRESHOLD //
-        && millis() > psm.timer  //
-        && psm.fired == false //
-        && psm.upCount >= PSM_UP_COUNT_LIMIT)
-    {
-      psm.ret = true;
-      psm.fired = true;
-      psm.startTime = millis() + PSM_START_LATENCY_DURATION;
-      psm.upCount = 0;
-    }
-  }
-
-  return psm.ret;
-
-}
-
-/**
-  Can be used to reset after psmCheck() has fired.
-*/
-void psmReset() {
-  psmSetup(psm.triggerPin);
-}
-
-/**
-  Initialize power supply module. Must be called once in startup().
-  triggerPin: GPIO with the voltage trigger signal
-*/
-void psmSetup(int triggerPin) {
-
-  // Let the Board time for start up
-  psm.startTime = millis() + PSM_START_LATENCY_DURATION;
-
-  // Init value for a good feeling
-  psm.triggerValue = 0;
-
-  // Reset temp. var
-  psm.timer = 0;
-
-  // Not send yet
-  psm.fired = false;
-
-  // Define GPIO with the trigger signal
-  psm.triggerPin = triggerPin;
-
-  // Reset limit
-  psm.upCount = 0;
-
-  // declare the analog in pin as input (default)
-  //  pinMode(psm.triggerPin, INPUT);
-  //  digitalWrite(psm.triggerPin, LOW);
-
-}
 
 /**********************************************************************/
 /**********************************************************************/
@@ -955,7 +1114,7 @@ void rstSetup(int gpioReed) {
 /*                                                                    */
 /*        Module BLT - Bluetooth LE Trasmitter                        */
 /*                                                                    */
-/*  Version 1.0, 11.08.2014                                           */
+/*  Version 1.1, 05.11.2014                                           */
 /*  Sends a value via BT LE in the format char(28), closed with \0:   */
 /*  D<long>: a long number, for instance "D2147483647"                */
 /*  M<String>: a message,  for instance "MSD_READ_ERROR"              */
@@ -1002,9 +1161,17 @@ void bltSetup(String welcomeMessage) {
   Sends a long value as distance message, e.g. "D12345". Character
   'D' will be add as prefix.
 /*********************************************************************/
-void bltSendData(long value) {
+void bltSendData(unsigned long value) {
 
   // Send actual distance
+  blt.buf = {'\0','\0','\0','\0','\0', //
+'\0','\0','\0','\0','\0', //
+'\0','\0','\0','\0','\0', //
+'\0','\0','\0','\0','\0', //
+'\0','\0','\0','\0','\0', //
+'\0','\0','\0' //
+};
+
   blt.data = "D" + String(value) + String('\0');
 
   blt.data.toCharArray(blt.buf, 28);
@@ -1017,6 +1184,14 @@ void bltSendData(long value) {
   String message Message text with < 26 characters, without lead 'M'.
 /*********************************************************************/
 void bltSendMessage(String message) {
+
+  blt.buf = {'\0','\0','\0','\0','\0', //
+'\0','\0','\0','\0','\0', //
+'\0','\0','\0','\0','\0', //
+'\0','\0','\0','\0','\0', //
+'\0','\0','\0','\0','\0', //
+'\0','\0','\0' //
+};
 
   // Send actual distance
   blt.data = "M" + message + String('\0');
@@ -1031,7 +1206,7 @@ void bltSendMessage(String message) {
 /*                                                                    */
 /*        Module SLO - A simple logger                                */
 /*                                                                    */
-/*  Version 1.6, 11.08.2014                                           */
+/*  Version 1.1, 05.11.2014                                           */
 /**********************************************************************/
 /**********************************************************************/
 /**********************************************************************/
@@ -1043,17 +1218,10 @@ SLO slo;
 /***********************************************************************
      Initializes the module. Call this in the setup().
 ************************************************************************/
-
-/**********************************************************************
-   Initializes SLO module. Call this in setup().
-   Boolean serialSwitch True enables serial logging, false disables it.
-/**********************************************************************/
 int sloSetup(boolean serialSwitch) {
   slo.serialSwitch = serialSwitch;
-  if (slo.serialSwitch) {
+  if (slo.serialSwitch)
     Serial.begin(9600);
-    sloLogS("SLO says hello !");
-  }
 }
 
 void sloLogS(String text) {
@@ -1061,18 +1229,23 @@ void sloLogS(String text) {
     Serial.println(text);
 }
 
-void sloLogI(String text, int value) {
+// For number types unsigned long and unsigned int
+void sloLogUL(String text, unsigned long value) {
   if (slo.serialSwitch) {
     Serial.print(text + ": ");
     Serial.println(value);
   }
 }
+
+// For number types long and int
 void sloLogL(String text, long value) {
   if (slo.serialSwitch) {
     Serial.print(text + ": ");
     Serial.println(value);
   }
 }
+
+//For boolean
 void sloLogB(String text, boolean value) {
   if (slo.serialSwitch) {
     Serial.print(text + ": ");

@@ -255,7 +255,7 @@ void sloLogB(String text, boolean value) {
 /*                                                                    */
 /*      Module MEM - Error Tolerance Persisting for 24AA256           */
 /*                                                                    */
-/*  Version 1.0, 22.10.2014                                           */
+/*  Version 1.0, 05.11.2014                                           */
 /*  Write an read one unsigned integer value to the external memory.  */
 /*  Only increasing values are supported (new value to be written     */
 /*  must be greate than the stored one.                               */
@@ -440,7 +440,7 @@ const MemTask MEM_TASK_VERIFY_WRITTEN_INDEX = 10;
 /***********************************************************************
      Returns valid index. Internal use only.
 ************************************************************************/
-struct MemValidValue memGetIndex() {
+struct MemValidValue memReadIndex() {
 
   // Read memory
   MemValidValue index = memReadBank(mem.roomAddress);
@@ -453,12 +453,42 @@ struct MemValidValue memGetIndex() {
 
   return index;
 }
+/***********************************************************************
+     Returns actual index pairNr. 
+     Precondition: memSetup() must be called.
+************************************************************************/
+byte memGetIndexPairNr() {
+  return mem.index.pairNr;
+}
+/***********************************************************************
+     Returns actual index value. 
+     Precondition: memSetup() must be called.
+************************************************************************/
+unsigned long memGetIndexValue() {
+  return mem.index.value;
+}
+
+/***********************************************************************
+     Returns actual value pairNr. 
+     Precondition: memSetup() must be called.
+************************************************************************/
+byte memGetDataPairNr() {
+  return mem.data.pairNr;
+}
+
+/***********************************************************************
+     Returns actual data value. Precondition: memSetup() must be called.
+************************************************************************/
+unsigned long memGetDataValue() {
+  return mem.data.value;
+}
+
 
 /***********************************************************************
      Returns valid data. Internal use only.
-     Precondition: memGetIndex() called before.
+     Precondition: memReadIndex() called before.
 ************************************************************************/
-struct MemValidValue memGetData(unsigned long index) {
+struct MemValidValue memReadData(unsigned long index) {
 
   // Read memory
   MemValidValue data = memReadBank(mem.roomAddress + index * MEM_BANK_SIZE);
@@ -594,11 +624,10 @@ boolean memSetup() {
   mem.roomAddress = MEM_ROOM_BANK_OFFSET * MEM_BANK_SIZE;
 
   // Index adress is at the first place inside a room
-  mem.index = memGetIndex();
-
+  mem.index = memReadIndex();
 
   // Data bank address need an offset 1 because of the index bank
-  mem.data = memGetData(mem.index.value);
+  mem.data = memReadData(mem.index.value);
 
   // Initialize counter with stored value
   mem.counter = mem.data.value;
@@ -852,7 +881,7 @@ byte memControl() {
       case MEM_TASK_VERIFY_WRITTEN_DATA:
         //sloLogS("Executing MEM_TASK_VERIFY_WRITTEN_DATA");
 
-        mem.writtenValue = memGetData(mem.writeIndexValue);
+        mem.writtenValue = memReadData(mem.writeIndexValue);
         //sloLogUL("mem.writeIndexValue=", mem.writeIndexValue);
         //sloLogUL("mem.writeCounter=", mem.writeCounter);
         //sloLogUL("mem.writePairNr=", mem.writePairNr);
@@ -927,3 +956,5 @@ byte memControl() {
 
   return mem.program;
 }
+
+
