@@ -5,7 +5,7 @@ Memory organization
    pages on the 24AA256)                                          
  - A value can be a data or a address (index)                     
  - A index address is a two Byte value (Word)                     
- - A data value is a 4 Byte value (unsigned int)                  
+ - A data value is a 4 Byte value (unsigned long)                  
  - Highest Byte is written first, then second highest one etc.    
  - Every value will be written twice into a page-pair             
  - A value is valid, if both values of a pair are equal           

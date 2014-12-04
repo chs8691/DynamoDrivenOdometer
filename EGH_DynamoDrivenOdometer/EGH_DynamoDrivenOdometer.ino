@@ -1,12 +1,24 @@
 /*
    Bike Distance Counter
-
+   Version 1.2, 2014/12/01
 
    Features:
    - Needs no battery, just bike dynamo and power support
      of the buffered front light
    - Read the actual wheel rotation and store it on EEPROM
    - Communicate the value via Bluetooth 4.0 to the Android App
+
+
+   Change Log
+
+   Version 1.2
+   - Store distance with 5 cm precision
+   - BT send real distance values in mm
+   - BT send interval every second
+
+   Version 1.1
+   - Demo release with all features but only sends ticks.
+
 
  */
 
@@ -39,6 +51,8 @@ String errorMessage;
 // In error case count for next sending
 boolean errorSend;
 
+//
+
 /******************************************************
   Setup
 /******************************************************/
@@ -48,9 +62,7 @@ void setup()
   byte pairNr = 0;
 
   // Open serial communications for debug and pc controlling
-  sloSetup(true); //Disable serial logging
-  //  sloSetup(false); //Enable serial logging
-
+  sloSetup(false); //Disable serial logging with false
 
   error = false;
   errorMessage = "-";
@@ -72,86 +84,22 @@ void setup()
 /******************************************************/
 void loop(void) {
 
-  //Count wheels rotations and send to app
-  // if((millis() % 1000)==0 && (millis() >= nextTickMillis)) //TEST Simulate reed
+  // Count wheels rotations and send to app
   if (rstRead())
   {
     memTick();
     lecFlash();
-   bltSendData(memGetCounter());
     sloLogUL("Counter=", memGetCounter());
   }
 
+  // Send actual data once a second
+  bltSendData(memGetCounter());
 
-  //Let MEM make its stuff
+  // Let MEM make its stuff
   memControl();
 
-  //Let LEC make its stuff
+  // Let LEC make its stuff
   lecControl();
-  /*
-    if (!error) {
-
-          // Number of card reading retries to much: Cancel reading and
-          // switch to error mode
-          if (!etpCheckReadRetry()) {
-            error = true;
-            errorMessage = "ERROR_SD_INIT";
-            bltSendMessage(errorMessage);
-            lecIntervalStart();
-            sloLogB("etpCheckReadRetryOverflow: error. Set error", error);
-            return;
-          }
-
-          // Card reading not finished
-          // Try it every tick
-          if (!valueRead && (millis() >= nextReadTry)) {
-            // Next try to read from card
-            if (etpReadValue()) {
-              sloLogL("Reading succesful, found value", etpGetDistance());
-              valueRead = true;
-              lecBlink();
-              //Done. Add stored value to actual counter.
-              counter += etpGetDistance();
-              counterStart = counter;
-            }
-            else {
-              nextReadTry = millis() + 1000; //Try it again after one second
-              sloLogS("Reading not successful");
-            }
-          }
-  */
-  /*
-
-              //Save to card when power breaks down
-
-              //if (!wrote && valueRead && counter != counterStart && (counter % 10) == 0) {//TEST: Write every 10 ticks
-              if (!wrote && valueRead && psmCheck()) {
-                wrote = true;
-
-
-                ret = true; //TEST: Simulate writing
-      //          ret = etpWrite(counter);
-
-                // Wrote distance value to card successfully
-                if (ret == 0) {
-                  // Give short signal to the user
-                  lecBlink();
-                  // Initialize power supply module for next time
-                  psmReset();
-                  sloLogS("Wrote successful");
-                }
-
-                // Error occured, let device fall into error state
-                else {
-                  lecIntervalStart();
-                  error = true;
-                  errorMessage = "ERROR_SD_WRITE";
-                  bltSendMessage(errorMessage);
-                  sloLogS("Writing error. Set errorMessage=" + errorMessage);
-                }
-              }
-      */
-
 
 
 
@@ -162,8 +110,8 @@ void loop(void) {
 /*                                                                    */
 /*      Module MEM - Error Tolerance Persisting for 24AA256           */
 /*                                                                    */
-/*  Version 1.0, 05.11.2014                                           */
-/*  Write an read one unsigned integer value to the external memory.  */
+/*  Version 1.1, 2014/12/01                                           */
+/*  Write an read one unsigned long value to the external memory.     */
 /*  Only increasing values are supported (new value to be written     */
 /*  must be greate than the stored one.                               */
 /*  The storage is protected against broken power supply while        */
@@ -188,7 +136,7 @@ void loop(void) {
 /*      so transactions will be buffered and handled in cycles. No    */
 /*      delay is used.                                                */
 /*   - Check with memCheck() before using memWrite() memRead()        */
-
+/*   - Max. distance value is 200,000 km with precision of 5 cm       */
 /**********************************************************************/
 /**********************************************************************/
 /**********************************************************************/
@@ -212,10 +160,10 @@ struct MemValidValue {
 
 typedef struct {
 
-  // actual value of the counter
+  // actual value of the counter in mm
   unsigned long counter;
 
-  // Last read value from memory
+  // Last read value from memory in mm
   unsigned long oldValue;
 
   // Absolute address of the actual data value (Page 1 of the pair)
@@ -257,6 +205,10 @@ typedef struct {
   //Address to to room (first byte)
   unsigned int roomAddress;
 
+  //Wheel circumference in mm
+  unsigned int circumferenceMM;
+
+
 } Mem;
 Mem mem;
 
@@ -282,7 +234,7 @@ const unsigned int MEM_UNUSED_BANKS = 0;
 
 // Size of fixed part in pages for configuration values (further release)
 // Set to 100 for further releases
-const unsigned int MEM_CONFIGURATION_BANKS = 0;
+const unsigned int MEM_CONFIGURATION_BANKS = 100;
 
 // Offset for first page of room part (in pages)
 const unsigned int MEM_ROOM_BANK_OFFSET = MEM_UNUSED_BANKS + MEM_CONFIGURATION_BANKS;
@@ -293,6 +245,13 @@ const unsigned long MEM_MAX_BANK_WRITINGS = 1000000L;
 
 // Needed for filter this values (EEPROM's bytes are initialized with 0xFF)
 const unsigned long MEM_MAX_UNSIGNED_LONG = 4294967295;
+
+// to store up to 200.000 km into an ULong as fine as possible, the value
+// has to reduced before writing to memory
+// In a later release this could be avoided by splitting the distance into
+// to ULongs (e.g. m and mm)
+const unsigned int MEM_DISTANCE_STORAGE_FACTOR = 50;
+
 
 // Latency time between two writes in milliseconds
 const unsigned long MEM_TIMER_INTERVALL_MS = 0;
@@ -344,6 +303,7 @@ const MemTask MEM_TASK_COPY_INDEX_WAIT = 9;
 // Read new written data value and check them
 const MemTask MEM_TASK_VERIFY_WRITTEN_INDEX = 10;
 
+
 /***********************************************************************
      Returns valid index. Internal use only.
 ************************************************************************/
@@ -362,13 +322,20 @@ struct MemValidValue memReadIndex() {
 }
 
 /***********************************************************************
-     Returns valid data. Internal use only.
+     Returns valid payload data by reading from memory and transorming
+     into the destination format.
+     Internal use only.
      Precondition: memReadIndex() called before.
+     Return
+       MemValidValue transformed data.
 ************************************************************************/
 struct MemValidValue memReadData(unsigned long index) {
 
   // Read memory
   MemValidValue data = memReadBank(mem.roomAddress + index * MEM_BANK_SIZE);
+
+  // Transform stored cm into mm
+  data.value *= MEM_DISTANCE_STORAGE_FACTOR;
 
   return data;
 
@@ -489,7 +456,7 @@ unsigned long memReadSingle(unsigned int address) {
 void memTick() {
 
   // increase counter
-  mem.counter++;
+  mem.counter += mem.circumferenceMM;
 
 }
 
@@ -529,9 +496,13 @@ boolean memSetup() {
   // address to the room
   mem.roomAddress = MEM_ROOM_BANK_OFFSET * MEM_BANK_SIZE;
 
+  //--- Set configuration data ---//
+  // Brompton has a wheel circumference of 1329 mm
+  mem.circumferenceMM = 1329;
+
+  //--- Set transaction data ---//
   // Index adress is at the first place inside a room
   mem.index = memReadIndex();
-
 
   // Data bank address need an offset 1 because of the index bank
   mem.data = memReadData(mem.index.value);
@@ -653,9 +624,9 @@ byte memControl() {
 
             //sloLogUL("mem.index.value=", mem.index.value);
             //sloLogUL("mem.data.value", mem.data.value);
-            //Check for max write cycles into the bank and switch to next bank
-            //            if (mem.index.value * mem.data.value > MEM_MAX_BANK_WRITINGS) {
-            if (mem.data.value > (mem.index.value * MEM_MAX_BANK_WRITINGS)) {
+            // Check for max write cycles into the bank and switch to next bank
+            // Number of ticks per Bank > 1E6
+            if ((mem.data.value / mem.circumferenceMM) > (mem.index.value * MEM_MAX_BANK_WRITINGS)) {
               //sloLogS("Starting MEM_PROGRAM_SWITCH_BANK");
               mem.program = MEM_PROGRAM_SWITCH_BANK;
               mem.task = MEM_TASK_WRITE_DATA;
@@ -818,11 +789,13 @@ byte memControl() {
 
         //--- Create copy of counter value ----
       case MEM_TASK_COPY_DATA:
-        writeTaskDoing(true, mem.writePairNr, mem.writeIndexValue, mem.writeCounter);
+        // Counter value has to be transform before writing
+        writeTaskDoing(true, mem.writePairNr, mem.writeIndexValue, mem.writeCounter / MEM_DISTANCE_STORAGE_FACTOR);
         break;
 
       case MEM_TASK_WRITE_DATA:
-        writeTaskDoing(false, mem.writePairNr, mem.writeIndexValue, mem.writeCounter);
+        // Counter value has to be transform before writing
+        writeTaskDoing(false, mem.writePairNr, mem.writeIndexValue, mem.writeCounter / MEM_DISTANCE_STORAGE_FACTOR);
         break;
 
       case MEM_TASK_VERIFY_WRITTEN_INDEX:
@@ -1128,6 +1101,11 @@ typedef struct {
 
   // data string to send
   String data;
+
+  // Time when next value can be read
+  // to elimate switch bouncing
+  unsigned long nextIntervalMs;
+
 } Blt;
 Blt blt;
 
@@ -1155,28 +1133,34 @@ void bltSetup(String welcomeMessage) {
 
   //Initialize send data
   bltSendMessage(welcomeMessage);
+
+  blt.nextIntervalMs = BLT_INTERVAL_MS;
 }
 
 /**********************************************************************
   Sends a long value as distance message, e.g. "D12345". Character
-  'D' will be add as prefix.
+  'D' will be add as prefix. Only sends after latency time.
 /*********************************************************************/
 void bltSendData(unsigned long value) {
 
-  // Send actual distance
-  blt.buf = {'\0','\0','\0','\0','\0', //
-'\0','\0','\0','\0','\0', //
-'\0','\0','\0','\0','\0', //
-'\0','\0','\0','\0','\0', //
-'\0','\0','\0','\0','\0', //
-'\0','\0','\0' //
-};
+  if (millis() > blt.nextIntervalMs) {
 
-  blt.data = "D" + String(value) + String('\0');
+    // Send actual distance
+    blt.buf = {'\0', '\0', '\0', '\0', '\0', //
+               '\0', '\0', '\0', '\0', '\0', //
+               '\0', '\0', '\0', '\0', '\0', //
+               '\0', '\0', '\0', '\0', '\0', //
+               '\0', '\0', '\0', '\0', '\0', //
+               '\0', '\0', '\0' //
+              };
 
-  blt.data.toCharArray(blt.buf, 28);
-  RFduinoBLE.send(blt.buf, 28);
+    blt.data = "D" + String(value) + String('\0');
 
+    blt.data.toCharArray(blt.buf, 28);
+    RFduinoBLE.send(blt.buf, 28);
+
+    blt.nextIntervalMs = millis() + BLT_INTERVAL_MS;
+  }
 }
 
 /**********************************************************************
@@ -1185,13 +1169,13 @@ void bltSendData(unsigned long value) {
 /*********************************************************************/
 void bltSendMessage(String message) {
 
-  blt.buf = {'\0','\0','\0','\0','\0', //
-'\0','\0','\0','\0','\0', //
-'\0','\0','\0','\0','\0', //
-'\0','\0','\0','\0','\0', //
-'\0','\0','\0','\0','\0', //
-'\0','\0','\0' //
-};
+  blt.buf = {'\0', '\0', '\0', '\0', '\0', //
+             '\0', '\0', '\0', '\0', '\0', //
+             '\0', '\0', '\0', '\0', '\0', //
+             '\0', '\0', '\0', '\0', '\0', //
+             '\0', '\0', '\0', '\0', '\0', //
+             '\0', '\0', '\0' //
+            };
 
   // Send actual distance
   blt.data = "M" + message + String('\0');
