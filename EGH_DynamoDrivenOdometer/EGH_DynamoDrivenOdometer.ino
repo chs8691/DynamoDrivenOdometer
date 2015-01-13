@@ -1,6 +1,6 @@
 /*
    Bike Distance Counter
-   Version 1.2, 2014/12/01
+   Version 1.2.1, 2015/01/13
 
    Features:
    - Needs no battery, just bike dynamo and power support
@@ -10,6 +10,9 @@
 
 
    Change Log
+
+   Version 1.2.1
+   - Change circumference to 1300 mm
 
    Version 1.2
    - Store distance with 5 cm precision
@@ -497,8 +500,8 @@ boolean memSetup() {
   mem.roomAddress = MEM_ROOM_BANK_OFFSET * MEM_BANK_SIZE;
 
   //--- Set configuration data ---//
-  // Brompton has a wheel circumference of 1329 mm
-  mem.circumferenceMM = 1329;
+  // My original Brompton with 6.8 bar air pressure has 1303 mm circumference
+  mem.circumferenceMM = 1300;
 
   //--- Set transaction data ---//
   // Index adress is at the first place inside a room
@@ -1160,6 +1163,7 @@ void bltSendData(unsigned long value) {
     RFduinoBLE.send(blt.buf, 28);
 
     blt.nextIntervalMs = millis() + BLT_INTERVAL_MS;
+      sloLogS("Send data " + blt.data);
   }
 }
 
