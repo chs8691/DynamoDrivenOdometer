@@ -72,7 +72,7 @@ void switchLed() {
 /*                                                                    */
 /*        Module BLT - Bluetooth LE Trasmitter                        */
 /*                                                                    */
-/*  Version 1.0, 11.08.2014                                           */
+/*  Version 1.1, 05.11.2014                                           */
 /*  Sends a value via BT LE in the format char(28), closed with \0:   */
 /*  D<long>: a long number, for instance "D2147483647"                */
 /*  M<String>: a message,  for instance "MSD_READ_ERROR"              */
@@ -80,12 +80,17 @@ void switchLed() {
 /**********************************************************************/
 /**********************************************************************/
 typedef struct {
-  
+
   //Temp. buffer with data
   char buf[28];
-  
+
   // data string to send
   String data;
+
+  // Time when next value can be read
+  // to elimate switch bouncing
+  unsigned long nextIntervalMs;
+
 } Blt;
 Blt blt;
 
@@ -99,31 +104,49 @@ const char* BLT_DEVICE_NAME = "DDO";
 /**********************************************************************
    Initializes BLT module. Call this in setup().
 /*********************************************************************/
-void bltSetup() {
+void bltSetup(String welcomeMessage) {
 
-  
+
   //Set interval von BLE exchange //TODO Neede?
- // RFduinoBLE.advertisementInterval = BLT_INTERVAL_MS; 
+  // RFduinoBLE.advertisementInterval = BLT_INTERVAL_MS;
 
   //set the BLE device name as it will appear when advertising
   RFduinoBLE.deviceName = BLT_DEVICE_NAME;
 
   // start the BLE stack
   RFduinoBLE.begin();
+
+  //Initialize send data
+  bltSendMessage(welcomeMessage);
+
+  blt.nextIntervalMs = BLT_INTERVAL_MS;
 }
 
 /**********************************************************************
   Sends a long value as distance message, e.g. "D12345". Character
-  'D' will be add as prefix.
+  'D' will be add as prefix. Only sends after latency time.
 /*********************************************************************/
-void bltSendData(long value) {
+void bltSendData(unsigned long value) {
 
-  // Send actual distance
-  blt.data = "D" + String(value) + String('\0');
+  if (millis() > blt.nextIntervalMs) {
 
-  blt.data.toCharArray(blt.buf, 28);
-  RFduinoBLE.send(blt.buf, 28);
+    // Send actual distance
+    blt.buf = {'\0', '\0', '\0', '\0', '\0', //
+               '\0', '\0', '\0', '\0', '\0', //
+               '\0', '\0', '\0', '\0', '\0', //
+               '\0', '\0', '\0', '\0', '\0', //
+               '\0', '\0', '\0', '\0', '\0', //
+               '\0', '\0', '\0' //
+              };
 
+    blt.data = "D" + String(value) + String('\0');
+
+    blt.data.toCharArray(blt.buf, 28);
+    RFduinoBLE.send(blt.buf, 28);
+
+    blt.nextIntervalMs = millis() + BLT_INTERVAL_MS;
+      sloLogS("Send data " + blt.data);
+  }
 }
 
 /**********************************************************************
@@ -131,6 +154,14 @@ void bltSendData(long value) {
   String message Message text with < 26 characters, without lead 'M'.
 /*********************************************************************/
 void bltSendMessage(String message) {
+
+  blt.buf = {'\0', '\0', '\0', '\0', '\0', //
+             '\0', '\0', '\0', '\0', '\0', //
+             '\0', '\0', '\0', '\0', '\0', //
+             '\0', '\0', '\0', '\0', '\0', //
+             '\0', '\0', '\0', '\0', '\0', //
+             '\0', '\0', '\0' //
+            };
 
   // Send actual distance
   blt.data = "M" + message + String('\0');

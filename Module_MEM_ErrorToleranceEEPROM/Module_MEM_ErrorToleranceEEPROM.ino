@@ -255,8 +255,8 @@ void sloLogB(String text, boolean value) {
 /*                                                                    */
 /*      Module MEM - Error Tolerance Persisting for 24AA256           */
 /*                                                                    */
-/*  Version 1.0, 05.11.2014                                           */
-/*  Write an read one unsigned integer value to the external memory.  */
+/*  Version 1.1, 2014/12/01                                           */
+/*  Write an read one unsigned long value to the external memory.     */
 /*  Only increasing values are supported (new value to be written     */
 /*  must be greate than the stored one.                               */
 /*  The storage is protected against broken power supply while        */
@@ -281,7 +281,7 @@ void sloLogB(String text, boolean value) {
 /*      so transactions will be buffered and handled in cycles. No    */
 /*      delay is used.                                                */
 /*   - Check with memCheck() before using memWrite() memRead()        */
-
+/*   - Max. distance value is 200,000 km with precision of 5 cm       */
 /**********************************************************************/
 /**********************************************************************/
 /**********************************************************************/
@@ -305,10 +305,10 @@ struct MemValidValue {
 
 typedef struct {
 
-  // actual value of the counter
+  // actual value of the counter in mm
   unsigned long counter;
 
-  // Last read value from memory
+  // Last read value from memory in mm
   unsigned long oldValue;
 
   // Absolute address of the actual data value (Page 1 of the pair)
@@ -350,6 +350,10 @@ typedef struct {
   //Address to to room (first byte)
   unsigned int roomAddress;
 
+  //Wheel circumference in mm
+  unsigned int circumferenceMM;
+
+
 } Mem;
 Mem mem;
 
@@ -375,7 +379,7 @@ const unsigned int MEM_UNUSED_BANKS = 0;
 
 // Size of fixed part in pages for configuration values (further release)
 // Set to 100 for further releases
-const unsigned int MEM_CONFIGURATION_BANKS = 0;
+const unsigned int MEM_CONFIGURATION_BANKS = 100;
 
 // Offset for first page of room part (in pages)
 const unsigned int MEM_ROOM_BANK_OFFSET = MEM_UNUSED_BANKS + MEM_CONFIGURATION_BANKS;
@@ -386,6 +390,13 @@ const unsigned long MEM_MAX_BANK_WRITINGS = 1000000L;
 
 // Needed for filter this values (EEPROM's bytes are initialized with 0xFF)
 const unsigned long MEM_MAX_UNSIGNED_LONG = 4294967295;
+
+// to store up to 200.000 km into an ULong as fine as possible, the value
+// has to reduced before writing to memory
+// In a later release this could be avoided by splitting the distance into
+// to ULongs (e.g. m and mm)
+const unsigned int MEM_DISTANCE_STORAGE_FACTOR = 50;
+
 
 // Latency time between two writes in milliseconds
 const unsigned long MEM_TIMER_INTERVALL_MS = 0;
@@ -437,6 +448,7 @@ const MemTask MEM_TASK_COPY_INDEX_WAIT = 9;
 // Read new written data value and check them
 const MemTask MEM_TASK_VERIFY_WRITTEN_INDEX = 10;
 
+
 /***********************************************************************
      Returns valid index. Internal use only.
 ************************************************************************/
@@ -453,15 +465,35 @@ struct MemValidValue memReadIndex() {
 
   return index;
 }
+
 /***********************************************************************
-     Returns actual index pairNr. 
+     Returns valid payload data by reading from memory and transorming
+     into the destination format.
+     Internal use only.
+     Precondition: memReadIndex() called before.
+     Return
+       MemValidValue transformed data.
+************************************************************************/
+struct MemValidValue memReadData(unsigned long index) {
+
+  // Read memory
+  MemValidValue data = memReadBank(mem.roomAddress + index * MEM_BANK_SIZE);
+
+  // Transform stored cm into mm
+  data.value *= MEM_DISTANCE_STORAGE_FACTOR;
+
+  return data;
+
+}
+/***********************************************************************
+     Returns actual index pairNr.
      Precondition: memSetup() must be called.
 ************************************************************************/
 byte memGetIndexPairNr() {
   return mem.index.pairNr;
 }
 /***********************************************************************
-     Returns actual index value. 
+     Returns actual index value.
      Precondition: memSetup() must be called.
 ************************************************************************/
 unsigned long memGetIndexValue() {
@@ -469,7 +501,7 @@ unsigned long memGetIndexValue() {
 }
 
 /***********************************************************************
-     Returns actual value pairNr. 
+     Returns actual value pairNr.
      Precondition: memSetup() must be called.
 ************************************************************************/
 byte memGetDataPairNr() {
@@ -481,20 +513,6 @@ byte memGetDataPairNr() {
 ************************************************************************/
 unsigned long memGetDataValue() {
   return mem.data.value;
-}
-
-
-/***********************************************************************
-     Returns valid data. Internal use only.
-     Precondition: memReadIndex() called before.
-************************************************************************/
-struct MemValidValue memReadData(unsigned long index) {
-
-  // Read memory
-  MemValidValue data = memReadBank(mem.roomAddress + index * MEM_BANK_SIZE);
-
-  return data;
-
 }
 
 /***********************************************************************
@@ -583,7 +601,7 @@ unsigned long memReadSingle(unsigned int address) {
 void memTick() {
 
   // increase counter
-  mem.counter++;
+  mem.counter += mem.circumferenceMM;
 
 }
 
@@ -623,6 +641,11 @@ boolean memSetup() {
   // address to the room
   mem.roomAddress = MEM_ROOM_BANK_OFFSET * MEM_BANK_SIZE;
 
+  //--- Set configuration data ---//
+  // My original Brompton with 6.8 bar air pressure has 1303 mm circumference
+  mem.circumferenceMM = 1300;
+
+  //--- Set transaction data ---//
   // Index adress is at the first place inside a room
   mem.index = memReadIndex();
 
@@ -746,9 +769,9 @@ byte memControl() {
 
             //sloLogUL("mem.index.value=", mem.index.value);
             //sloLogUL("mem.data.value", mem.data.value);
-            //Check for max write cycles into the bank and switch to next bank
-            //            if (mem.index.value * mem.data.value > MEM_MAX_BANK_WRITINGS) {
-            if (mem.data.value > (mem.index.value * MEM_MAX_BANK_WRITINGS)) {
+            // Check for max write cycles into the bank and switch to next bank
+            // Number of ticks per Bank > 1E6
+            if ((mem.data.value / mem.circumferenceMM) > (mem.index.value * MEM_MAX_BANK_WRITINGS)) {
               //sloLogS("Starting MEM_PROGRAM_SWITCH_BANK");
               mem.program = MEM_PROGRAM_SWITCH_BANK;
               mem.task = MEM_TASK_WRITE_DATA;
@@ -911,11 +934,13 @@ byte memControl() {
 
         //--- Create copy of counter value ----
       case MEM_TASK_COPY_DATA:
-        writeTaskDoing(true, mem.writePairNr, mem.writeIndexValue, mem.writeCounter);
+        // Counter value has to be transform before writing
+        writeTaskDoing(true, mem.writePairNr, mem.writeIndexValue, mem.writeCounter / MEM_DISTANCE_STORAGE_FACTOR);
         break;
 
       case MEM_TASK_WRITE_DATA:
-        writeTaskDoing(false, mem.writePairNr, mem.writeIndexValue, mem.writeCounter);
+        // Counter value has to be transform before writing
+        writeTaskDoing(false, mem.writePairNr, mem.writeIndexValue, mem.writeCounter / MEM_DISTANCE_STORAGE_FACTOR);
         break;
 
       case MEM_TASK_VERIFY_WRITTEN_INDEX:
@@ -956,5 +981,4 @@ byte memControl() {
 
   return mem.program;
 }
-
 
