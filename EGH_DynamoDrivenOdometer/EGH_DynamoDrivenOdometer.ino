@@ -97,6 +97,7 @@ void loop(void) {
 
   // Send actual data once a second
   bltSendData(memGetCounter());
+ //bltSendBikeId();
 
   // Let MEM make its stuff
   memControl();
@@ -1090,9 +1091,10 @@ void rstSetup(int gpioReed) {
 /*                                                                    */
 /*        Module BLT - Bluetooth LE Trasmitter                        */
 /*                                                                    */
-/*  Version 1.1, 05.11.2014                                           */
+/*  Version 1.2, 27.01.2015                                           */
 /*  Sends a value via BT LE in the format char(28), closed with \0:   */
 /*  D<long>: a long number, for instance "D2147483647"                */
+/*  B<String>: The bike ID,  for instance "BBROMPTON448010"           */
 /*  M<String>: a message,  for instance "MSD_READ_ERROR"              */
 /**********************************************************************/
 /**********************************************************************/
@@ -1117,7 +1119,12 @@ Blt blt;
 const int BLT_INTERVAL_MS = 1000;
 
 // Name of the device, appears in the advertising. Keep it short.
+// The app can use this to identify the type of device, but not 
+// a particular bike.
 const char* BLT_DEVICE_NAME = "DDO";
+
+// Unique bike ID to identify this device. 
+const String BLT_BIKE_ID = "CHS-RFDUINO-DEV-0";
 
 /**********************************************************************
    Initializes BLT module. Call this in setup().
@@ -1183,6 +1190,29 @@ void bltSendMessage(String message) {
 
   // Send actual distance
   blt.data = "M" + message + String('\0');
+
+  blt.data.toCharArray(blt.buf, 28);
+  RFduinoBLE.send(blt.buf, 28);
+
+}
+
+/**********************************************************************
+  Sends bike ID, e.g. so the app can assign the data values to 
+  different bikes.
+  String message Message text with < 26 characters, without lead 'M'.
+/*********************************************************************/
+void bltSendBikeId() {
+
+  blt.buf = {'\0', '\0', '\0', '\0', '\0', //
+             '\0', '\0', '\0', '\0', '\0', //
+             '\0', '\0', '\0', '\0', '\0', //
+             '\0', '\0', '\0', '\0', '\0', //
+             '\0', '\0', '\0', '\0', '\0', //
+             '\0', '\0', '\0' //
+            };
+
+  // Send actual distance
+  blt.data = "B" + BLT_BIKE_ID + String('\0');
 
   blt.data.toCharArray(blt.buf, 28);
   RFduinoBLE.send(blt.buf, 28);
